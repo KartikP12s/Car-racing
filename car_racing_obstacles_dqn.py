@@ -1,15 +1,4 @@
-# car_racing_obstacles_td3_visible_fixed.py
-#
-# Fixed TD3 version.
-#
-# Important fixes compared to previous TD3 file:
-# 1. Keeps your obstacle rendering/spawn logic basically the same.
-# 2. Adds a stronger expert controller.
-# 3. Adds behavior cloning pretraining before TD3 training.
-# 4. Starts with very low exploration noise.
-# 5. Makes curriculum slower: 0 -> 2 -> 6 -> 12 obstacles.
-# 6. Keeps reward simpler and gives off-track recovery chance.
-# 7. Uses TD3 continuous control instead of DQN discrete actions.
+# car_racing_obstacles_dqn_fixed_visible_v2.py
 
 import os
 import cv2
@@ -32,34 +21,52 @@ SEED = 7
 
 FRAME_STACK = 4
 IMAGE_SIZE = 84
-ACTION_DIM = 3
 
-TOTAL_EPISODES = 600
+TOTAL_EPISODES = 400
 MAX_STEPS = 2000
 
-BATCH_SIZE = 64
-BUFFER_SIZE = 120_000
+BATCH_SIZE = 32
+BUFFER_SIZE = 80_000
 GAMMA = 0.99
-TAU = 0.005
+LR = 1e-4
 
-ACTOR_LR = 5e-5
-CRITIC_LR = 5e-4
+WARMUP_STEPS = 15000
+START_LEARNING_AFTER = 3000
+TRAIN_EVERY = 4
+TARGET_UPDATE_EVERY = 1000
 
-WARMUP_STEPS = 25000
-BC_STEPS = 3000
-START_LEARNING_AFTER = 8000
-TRAIN_EVERY = 2
+EPSILON_START = 0.35
+EPSILON_END = 0.03
+EPSILON_DECAY_STEPS = 120_000
 
-POLICY_DELAY = 2
-TARGET_NOISE_STD = 0.08
-TARGET_NOISE_CLIP = 0.18
+MODEL_PATH = "dqn_carracing_visible_obstacles_v2.pt"
+VIDEO_PATH = "dqn_visible_obstacles_run_v2.mp4"
 
-EXPLORATION_NOISE_START = 0.08
-EXPLORATION_NOISE_END = 0.025
-EXPLORATION_DECAY_STEPS = 180_000
 
-MODEL_PATH = "td3_carracing_visible_obstacles_fixed.pt"
-VIDEO_PATH = "td3_visible_obstacles_fixed_run.mp4"
+# DQN still chooses from fixed continuous actions.
+# Expanded slightly, but still safe/smooth. Obstacles are unchanged.
+ACTIONS = [
+    np.array([0.00, 0.36, 0.00], dtype=np.float32),
+    np.array([0.00, 0.24, 0.00], dtype=np.float32),
+    np.array([0.00, 0.10, 0.18], dtype=np.float32),
+
+    np.array([-0.08, 0.34, 0.00], dtype=np.float32),
+    np.array([0.08, 0.34, 0.00], dtype=np.float32),
+
+    np.array([-0.16, 0.30, 0.00], dtype=np.float32),
+    np.array([0.16, 0.30, 0.00], dtype=np.float32),
+
+    np.array([-0.28, 0.22, 0.02], dtype=np.float32),
+    np.array([0.28, 0.22, 0.02], dtype=np.float32),
+
+    np.array([-0.42, 0.12, 0.08], dtype=np.float32),
+    np.array([0.42, 0.12, 0.08], dtype=np.float32),
+
+    np.array([-0.55, 0.04, 0.18], dtype=np.float32),
+    np.array([0.55, 0.04, 0.18], dtype=np.float32),
+]
+
+NUM_ACTIONS = len(ACTIONS)
 
 
 def set_seeds(seed):
@@ -71,21 +78,12 @@ def set_seeds(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def curriculum_obstacle_count(episode):
-    # Slower curriculum.
-    # Your previous TD3 was failing at 0 obstacles, so do not rush obstacles.
-    if episode <= 180:
-        return 0
-    if episode <= 300:
-        return 2
-    if episode <= 450:
-        return 6
-    return 12
-
-
 def preprocess_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+    # Remove bottom dashboard area.
     gray = gray[:84, :]
+
     resized = cv2.resize(gray, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
     return resized.astype(np.float32) / 255.0
 
@@ -110,21 +108,13 @@ class FrameStack:
         return np.stack(self.frames, axis=0)
 
 
-def clip_action(action):
-    action = np.asarray(action, dtype=np.float32).copy()
-    action[0] = np.clip(action[0], -1.0, 1.0)
-    action[1] = np.clip(action[1], 0.0, 1.0)
-    action[2] = np.clip(action[2], 0.0, 1.0)
-    return action
-
-
 class VisibleTrackObstacleCarRacing(gym.Wrapper):
     def __init__(
         self,
         env,
         num_obstacles=12,
         obstacle_radius=0.32,
-        collision_penalty=-20.0,
+        collision_penalty=-35.0,
         obstacle_step_penalty=-0.0005,
         debug=False,
     ):
@@ -154,6 +144,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         self._spawn_fixed_world_obstacles()
         self._add_obstacles_to_road_render()
 
+        # Important: return rendered frame after adding visible obstacles.
         obs = self.env.render()
 
         if self.debug:
@@ -172,8 +163,9 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         return obs, info
 
     def step(self, action):
-        action = clip_action(action)
-        obs, base_reward, terminated, truncated, info = self.env.step(action)
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        # Always use current rendered frame after physics step.
         obs = self.env.render()
 
         lateral_signed = self._track_lateral_position()
@@ -183,10 +175,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         progress = self._track_progress()
 
         progress_delta = progress - self.prev_progress
-
         if progress_delta < -0.50:
             progress_delta = 0.0
-
         progress_delta = max(0.0, progress_delta)
         self.prev_progress = progress
 
@@ -197,16 +187,15 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         info["speed"] = speed
         info["heading_error"] = heading_error
         info["progress"] = progress
-        info["progress_delta"] = progress_delta
         info["lap_complete"] = progress >= 0.95
         info["hit_obstacle"] = False
         info["off_track_terminated"] = False
 
-        reward = float(base_reward)
+        # Reward real progress directly. This is the main fix.
+        reward += 3.0 * progress_delta
 
-        # Keep reward simple.
-        reward += 0.40 * progress_delta * 100.0
-
+        # Collision should hurt, but should not instantly end training every time.
+        # Cooldown prevents one collision from applying the penalty on 20 frames in a row.
         if self.collision_cooldown > 0:
             self.collision_cooldown -= 1
 
@@ -217,37 +206,52 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         else:
             reward += self.obstacle_step_penalty
 
-        # More forgiving off-track logic.
-        if lateral > 4.20:
+        # Give recovery chance instead of instant death.
+        if lateral > 3.25:
             self.offtrack_counter += 1
-            reward -= 0.04
-        elif lateral > 3.20:
+            reward -= 2.0
+        elif lateral > 2.75:
             self.offtrack_counter += 1
-            reward -= 0.02
+            reward -= 0.60
         else:
             self.offtrack_counter = max(0, self.offtrack_counter - 2)
 
-        if self.offtrack_counter > 35:
-            reward -= 5.0
+        if self.offtrack_counter >= 25:
+            reward -= 25.0
             terminated = True
             info["off_track_terminated"] = True
 
-        if lateral < 1.35:
+        # Centering reward: not too strict, but encourages stable driving.
+        if lateral < 1.20:
+            reward += 0.04
+        elif lateral < 2.00:
             reward += 0.015
-        elif lateral > 2.80:
-            reward -= 0.02
+        elif lateral > 2.40:
+            reward -= 0.15
 
-        if 12.0 < speed < 35.0:
-            reward += 0.01
-        elif speed > 45.0:
-            reward -= 0.03
-        elif speed < 2.0:
-            reward -= 0.02
+        # Heading shaping.
+        if heading_error < 0.25:
+            reward += 0.035
+        elif heading_error > 0.95:
+            reward -= 0.20
 
-        if heading_error < 0.35:
-            reward += 0.01
-        elif heading_error > 1.25:
+        # Speed shaping. Softer than before because high speed was over-punished.
+        if 8.0 <= speed <= 30.0:
+            reward += 0.025
+        elif 30.0 < speed <= 42.0:
+            reward -= 0.04
+        elif speed > 42.0:
+            reward -= 0.12
+        elif speed < 2.5:
             reward -= 0.03
+
+        # Slow down near obstacles, but do not make the agent scared to move.
+        near_ob = self.nearest_forward_obstacle(lookahead=22)
+        if near_ob is not None and speed > 32.0:
+            reward -= 0.15
+
+        if progress >= 0.90:
+            reward += 1.0
 
         if progress >= 0.95:
             reward += 100.0
@@ -262,18 +266,18 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         base = self.env.unwrapped
         track = getattr(base, "track", None)
 
-        if self.num_obstacles <= 0:
-            return
-
         if track is None or len(track) < 100:
             return
 
         n = len(track)
+
+        # Avoid very beginning and very end.
         start = int(0.16 * n)
         end = int(0.88 * n)
 
         obstacle_indices = np.linspace(start, end, self.num_obstacles, dtype=int)
 
+        # Kept exactly the same obstacle offsets from your version.
         offset_pattern = [
             -1.15, 1.15,
             -1.35, 1.35,
@@ -294,6 +298,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             ox = x + offset * nx
             oy = y + offset * ny
 
+            # Avoid spawning obstacles too close to each other.
             too_close = False
 
             for px, py in used_positions:
@@ -337,11 +342,13 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         segments = []
 
+        # Main wire.
         segments.append((
             [(x1, y1), (x2, y2)],
             (40, 40, 40)
         ))
 
+        # Small sharp barbs.
         for s in [-0.65, -0.25, 0.20, 0.60]:
             bx = cx + s * length * tx
             by = cy + s * length * ty
@@ -375,9 +382,11 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             if track is not None and len(track) > ob["track_index"]:
                 _, beta, _, _ = track[ob["track_index"]]
 
+            # Small warning base under the wire.
             warning = self._make_circle_polygon(ob["x"], ob["y"], ob["r"] * 1.45)
             base.road_poly.append((warning, (180, 40, 40)))
 
+            # Draw barbed wire as multiple thin dark polygons.
             segments = self._make_barbed_wire_segments(
                 ob["x"],
                 ob["y"],
@@ -544,63 +553,33 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         return best_ob
 
 
-def make_env(num_obstacles=12, debug=False):
-    base_env = gym.make(
-        ENV_ID,
-        render_mode="rgb_array",
-        continuous=True,
-        domain_randomize=False,
-        lap_complete_percent=0.95,
-    )
-
-    env = VisibleTrackObstacleCarRacing(
-        base_env,
-        num_obstacles=num_obstacles,
-        obstacle_radius=0.32,
-        collision_penalty=-20.0,
-        obstacle_step_penalty=-0.0005,
-        debug=debug,
-    )
-
-    return env
-
-
 class ReplayBuffer:
     def __init__(self, capacity):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
+    def push(self, state, action_index, reward, next_state, done):
+        # Small clipping prevents very large target spikes.
         reward = float(np.clip(reward, -50.0, 50.0))
-        action = clip_action(action)
-        self.buffer.append((state, action, reward, next_state, float(done)))
+        self.buffer.append((state, action_index, reward, next_state, float(done)))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
         states = torch.tensor(np.array(states), dtype=torch.float32).to(DEVICE)
-        actions = torch.tensor(np.array(actions), dtype=torch.float32).to(DEVICE)
+        actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(DEVICE)
         rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(DEVICE)
         next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(DEVICE)
         dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(DEVICE)
 
         return states, actions, rewards, next_states, dones
 
-    def sample_states_actions(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states, actions, _, _, _ = zip(*batch)
-
-        states = torch.tensor(np.array(states), dtype=torch.float32).to(DEVICE)
-        actions = torch.tensor(np.array(actions), dtype=torch.float32).to(DEVICE)
-
-        return states, actions
-
     def __len__(self):
         return len(self.buffer)
 
 
-class ConvEncoder(nn.Module):
-    def __init__(self):
+class DQN(nn.Module):
+    def __init__(self, num_actions):
         super().__init__()
 
         self.conv = nn.Sequential(
@@ -618,283 +597,161 @@ class ConvEncoder(nn.Module):
 
         with torch.no_grad():
             dummy = torch.zeros(1, FRAME_STACK, IMAGE_SIZE, IMAGE_SIZE)
-            self.out_dim = self.conv(dummy).shape[1]
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Actor(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.encoder = ConvEncoder()
+            conv_dim = self.conv(dummy).shape[1]
 
         self.fc = nn.Sequential(
-            nn.Linear(self.encoder.out_dim, 512),
+            nn.Linear(conv_dim, 512),
             nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
+            nn.Linear(512, num_actions)
         )
 
-        self.steer_head = nn.Linear(256, 1)
-        self.gas_head = nn.Linear(256, 1)
-        self.brake_head = nn.Linear(256, 1)
-
-        # Better initial behavior:
-        # low brake, moderate gas.
-        nn.init.constant_(self.gas_head.bias, -0.6)
-        nn.init.constant_(self.brake_head.bias, -4.0)
-        nn.init.constant_(self.steer_head.bias, 0.0)
-
-    def forward(self, state):
-        z = self.encoder(state)
-        z = self.fc(z)
-
-        steer = torch.tanh(self.steer_head(z))
-
-        # Limit gas range slightly so early policy does not go insane.
-        gas = 0.05 + 0.55 * torch.sigmoid(self.gas_head(z))
-
-        # Brake allowed, but starts near zero.
-        brake = 0.45 * torch.sigmoid(self.brake_head(z))
-
-        return torch.cat([steer, gas, brake], dim=1)
+    def forward(self, x):
+        return self.fc(self.conv(x))
 
 
-class Critic(nn.Module):
+class DQNAgent:
     def __init__(self):
-        super().__init__()
+        self.policy_net = DQN(NUM_ACTIONS).to(DEVICE)
+        self.target_net = DQN(NUM_ACTIONS).to(DEVICE)
 
-        self.encoder = ConvEncoder()
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
 
-        self.q1 = nn.Sequential(
-            nn.Linear(self.encoder.out_dim + ACTION_DIM, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=LR)
+        self.steps_done = 0
+
+    def epsilon(self):
+        return EPSILON_END + (EPSILON_START - EPSILON_END) * max(
+            0.0,
+            (EPSILON_DECAY_STEPS - self.steps_done) / EPSILON_DECAY_STEPS
         )
-
-        self.q2 = nn.Sequential(
-            nn.Linear(self.encoder.out_dim + ACTION_DIM, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
-        )
-
-    def forward(self, state, action):
-        z = self.encoder(state)
-        za = torch.cat([z, action], dim=1)
-        return self.q1(za), self.q2(za)
-
-    def q1_only(self, state, action):
-        z = self.encoder(state)
-        za = torch.cat([z, action], dim=1)
-        return self.q1(za)
-
-
-class TD3Agent:
-    def __init__(self):
-        self.actor = Actor().to(DEVICE)
-        self.actor_target = Actor().to(DEVICE)
-        self.critic = Critic().to(DEVICE)
-        self.critic_target = Critic().to(DEVICE)
-
-        self.actor_target.load_state_dict(self.actor.state_dict())
-        self.critic_target.load_state_dict(self.critic.state_dict())
-
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
-
-        self.total_steps = 0
-        self.train_steps = 0
-
-    def exploration_noise(self):
-        frac = max(0.0, (EXPLORATION_DECAY_STEPS - self.total_steps) / EXPLORATION_DECAY_STEPS)
-        return EXPLORATION_NOISE_END + (EXPLORATION_NOISE_START - EXPLORATION_NOISE_END) * frac
 
     def select_action(self, state, training=True):
+        if training:
+            eps = self.epsilon()
+            self.steps_done += 1
+
+            if random.random() < eps:
+                return random.randrange(NUM_ACTIONS)
+
         state_tensor = torch.tensor(
             state,
             dtype=torch.float32
         ).unsqueeze(0).to(DEVICE)
 
         with torch.no_grad():
-            action = self.actor(state_tensor).cpu().numpy()[0]
-
-        if training:
-            self.total_steps += 1
-            noise_std = self.exploration_noise()
-
-            noise = np.array([
-                np.random.normal(0.0, noise_std),
-                np.random.normal(0.0, noise_std * 0.35),
-                np.random.normal(0.0, noise_std * 0.20),
-            ], dtype=np.float32)
-
-            action = action + noise
-
-        return clip_action(action)
-
-    def behavior_clone_step(self, replay_buffer):
-        if len(replay_buffer) < BATCH_SIZE:
-            return None
-
-        states, expert_actions = replay_buffer.sample_states_actions(BATCH_SIZE)
-        pred_actions = self.actor(states)
-
-        loss = F.mse_loss(pred_actions, expert_actions)
-
-        self.actor_optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
-        self.actor_optimizer.step()
-
-        self.actor_target.load_state_dict(self.actor.state_dict())
-
-        return loss.item()
+            q_values = self.policy_net(state_tensor)
+            return q_values.argmax(dim=1).item()
 
     def train_step(self, replay_buffer):
         if len(replay_buffer) < BATCH_SIZE:
-            return None, None
-
-        self.train_steps += 1
+            return None
 
         states, actions, rewards, next_states, dones = replay_buffer.sample(BATCH_SIZE)
 
+        q = self.policy_net(states).gather(1, actions)
+
         with torch.no_grad():
-            noise = torch.randn_like(actions) * TARGET_NOISE_STD
-            noise[:, 0] = noise[:, 0].clamp(-TARGET_NOISE_CLIP, TARGET_NOISE_CLIP)
-            noise[:, 1] = noise[:, 1].clamp(-TARGET_NOISE_CLIP * 0.5, TARGET_NOISE_CLIP * 0.5)
-            noise[:, 2] = noise[:, 2].clamp(-TARGET_NOISE_CLIP * 0.5, TARGET_NOISE_CLIP * 0.5)
-
-            next_actions = self.actor_target(next_states) + noise
-            next_actions[:, 0] = next_actions[:, 0].clamp(-1.0, 1.0)
-            next_actions[:, 1] = next_actions[:, 1].clamp(0.0, 1.0)
-            next_actions[:, 2] = next_actions[:, 2].clamp(0.0, 1.0)
-
-            target_q1, target_q2 = self.critic_target(next_states, next_actions)
-            target_q = torch.min(target_q1, target_q2)
-            target_q = rewards + GAMMA * (1.0 - dones) * target_q
+            # Double DQN target: policy chooses, target evaluates.
+            next_actions = self.policy_net(next_states).argmax(1, keepdim=True)
+            next_q = self.target_net(next_states).gather(1, next_actions)
+            target_q = rewards + GAMMA * (1.0 - dones) * next_q
             target_q = torch.clamp(target_q, -80.0, 120.0)
 
-        current_q1, current_q2 = self.critic(states, actions)
+        loss = F.smooth_l1_loss(q, target_q)
 
-        critic_loss = F.smooth_l1_loss(current_q1, target_q) + F.smooth_l1_loss(current_q2, target_q)
+        self.optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
+        self.optimizer.step()
 
-        self.critic_optimizer.zero_grad()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5.0)
-        self.critic_optimizer.step()
+        return loss.item()
 
-        actor_loss_value = None
-
-        if self.train_steps % POLICY_DELAY == 0:
-            actor_actions = self.actor(states)
-            actor_loss = -self.critic.q1_only(states, actor_actions).mean()
-
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
-            self.actor_optimizer.step()
-
-            self.soft_update(self.actor_target, self.actor)
-            self.soft_update(self.critic_target, self.critic)
-
-            actor_loss_value = actor_loss.item()
-
-        return critic_loss.item(), actor_loss_value
-
-    def soft_update(self, target, source):
-        for target_param, source_param in zip(target.parameters(), source.parameters()):
-            target_param.data.copy_(
-                TAU * source_param.data + (1.0 - TAU) * target_param.data
-            )
+    def update_target(self):
+        self.target_net.load_state_dict(self.policy_net.state_dict())
 
     def save(self, path):
         torch.save({
-            "actor": self.actor.state_dict(),
-            "actor_target": self.actor_target.state_dict(),
-            "critic": self.critic.state_dict(),
-            "critic_target": self.critic_target.state_dict(),
-            "total_steps": self.total_steps,
-            "train_steps": self.train_steps,
+            "policy_net": self.policy_net.state_dict(),
+            "target_net": self.target_net.state_dict(),
+            "steps_done": self.steps_done,
         }, path)
 
     def load(self, path):
         ckpt = torch.load(path, map_location=DEVICE)
-        self.actor.load_state_dict(ckpt["actor"])
-        self.actor_target.load_state_dict(ckpt["actor_target"])
-        self.critic.load_state_dict(ckpt["critic"])
-        self.critic_target.load_state_dict(ckpt["critic_target"])
-        self.total_steps = ckpt.get("total_steps", 0)
-        self.train_steps = ckpt.get("train_steps", 0)
+        self.policy_net.load_state_dict(ckpt["policy_net"])
+        self.target_net.load_state_dict(ckpt["target_net"])
+        self.steps_done = ckpt.get("steps_done", 0)
+
+
+def make_env(debug=False):
+    base_env = gym.make(
+        ENV_ID,
+        render_mode="rgb_array",
+        continuous=True,
+        domain_randomize=False,
+        lap_complete_percent=0.95,
+    )
+
+    env = VisibleTrackObstacleCarRacing(
+        base_env,
+        num_obstacles=12,
+        obstacle_radius=0.32,
+        collision_penalty=-35.0,
+        obstacle_step_penalty=-0.0005,
+        debug=debug,
+    )
+
+    return env
+
+
+def closest_action_index(action):
+    distances = [np.linalg.norm(action - a) for a in ACTIONS]
+    return int(np.argmin(distances))
 
 
 def angle_normalize(x):
     return (x + np.pi) % (2 * np.pi) - np.pi
 
 
-def get_track_info(env):
+def simple_centerline_action(env):
     base = env.unwrapped
     car = getattr(base, "car", None)
     track = getattr(base, "track", None)
 
     if car is None or track is None or len(track) == 0:
-        return None
-
-    car_x = car.hull.position[0]
-    car_y = car.hull.position[1]
-
-    best_idx = 0
-    best_dist = float("inf")
-
-    for i, (_, _, x, y) in enumerate(track):
-        d = (x - car_x) ** 2 + (y - car_y) ** 2
-
-        if d < best_dist:
-            best_dist = d
-            best_idx = i
-
-    return base, car, track, best_idx
-
-
-def simple_centerline_action(env):
-    info = get_track_info(env)
-
-    if info is None:
-        return np.array([0.0, 0.28, 0.0], dtype=np.float32)
-
-    base, car, track, nearest = info
+        return np.array([0.0, 0.30, 0.0], dtype=np.float32)
 
     car_x = car.hull.position[0]
     car_y = car.hull.position[1]
     car_angle = car.hull.angle
 
-    # Look ahead more when moving faster.
-    v = car.hull.linearVelocity
-    speed = float(np.sqrt(v[0] ** 2 + v[1] ** 2))
+    dists = []
 
-    lookahead = int(np.clip(6 + speed * 0.20, 6, 16))
-    target = (nearest + lookahead) % len(track)
+    for _, _, x, y in track:
+        dists.append((x - car_x) ** 2 + (y - car_y) ** 2)
 
+    nearest = int(np.argmin(dists))
+
+    target = (nearest + 8) % len(track)
     _, _, tx, ty = track[target]
 
     desired_angle = np.arctan2(ty - car_y, tx - car_x)
     angle_diff = angle_normalize(desired_angle - car_angle)
 
-    # Main steering.
-    steering = angle_diff * 0.95
+    steering = float(np.clip(angle_diff * 0.75, -0.52, 0.52))
 
     lateral_signed = 0.0
 
     if hasattr(env, "_track_lateral_position"):
         lateral_signed = env._track_lateral_position()
 
-    # Use track normal to recover center, but not too aggressively.
-    steering -= 0.18 * lateral_signed
+    # Strong center recovery before grass.
+    if lateral_signed > 1.55:
+        steering -= 0.35
+
+    elif lateral_signed < -1.55:
+        steering += 0.35
 
     nearest_ob = None
 
@@ -912,178 +769,84 @@ def simple_centerline_action(env):
             obstacle_close = True
             ob_offset = nearest_ob["offset"]
 
-            # If obstacle is on right side, steer slightly left. Opposite for left.
+            # Avoid obstacle but do not over-dodge into grass.
             if ob_offset > 0:
-                steering -= 0.20
+                steering -= 0.25
             else:
-                steering += 0.20
+                steering += 0.25
 
-            # But center recovery wins near edge.
+            # If already near edge, recover center first.
             if lateral_signed > 1.70:
-                steering -= 0.35
+                steering -= 0.45
             elif lateral_signed < -1.70:
-                steering += 0.35
+                steering += 0.45
 
-    steering = float(np.clip(steering, -0.75, 0.75))
+    steering = float(np.clip(steering, -0.55, 0.55))
 
-    abs_steer = abs(steering)
-
-    # Better speed controller.
     if obstacle_close:
-        target_speed = 17.0
-    elif abs_steer < 0.12:
-        target_speed = 31.0
-    elif abs_steer < 0.32:
-        target_speed = 24.0
+        gas = 0.14
+        brake = 0.10
+
+    elif abs(steering) < 0.12:
+        gas = 0.34
+        brake = 0.00
+
+    elif abs(steering) < 0.32:
+        gas = 0.24
+        brake = 0.02
+
     else:
-        target_speed = 16.0
+        gas = 0.12
+        brake = 0.08
 
-    if speed < target_speed - 3.0:
-        gas = 0.42
-        brake = 0.00
-    elif speed < target_speed:
-        gas = 0.28
-        brake = 0.00
-    elif speed > target_speed + 7.0:
-        gas = 0.04
-        brake = 0.18
-    elif speed > target_speed + 3.0:
-        gas = 0.08
-        brake = 0.06
-    else:
-        gas = 0.18
-        brake = 0.00
-
-    return clip_action(np.array([steering, gas, brake], dtype=np.float32))
+    return np.array([steering, gas, brake], dtype=np.float32)
 
 
-def evaluate_expert(num_obstacles=0, seed=SEED, max_steps=1000, video_path=None):
-    env = make_env(num_obstacles=num_obstacles, debug=(num_obstacles == 12 and video_path is not None))
-    frames = []
+def warmup_replay_buffer(env, stacker, replay_buffer, steps=WARMUP_STEPS):
+    print(f"[WARMUP] Collecting {steps} obstacle-aware expert steps...")
 
-    obs, info = env.reset(seed=seed)
-
-    total_reward = 0.0
-    max_progress = 0.0
-    hit_obstacle = False
-    off_track = False
-
-    for step in range(max_steps):
-        action = simple_centerline_action(env)
-        obs, reward, terminated, truncated, info = env.step(action)
-
-        if video_path is not None:
-            frames.append(env.render())
-
-        total_reward += reward
-        max_progress = max(max_progress, info.get("progress", 0.0))
-
-        if info.get("hit_obstacle", False):
-            hit_obstacle = True
-
-        if info.get("off_track_terminated", False):
-            off_track = True
-
-        if terminated or truncated:
-            break
-
-    env.close()
-
-    if video_path is not None and len(frames) > 0:
-        frames = upscale_frames(frames, scale=4)
-        imageio.mimsave(video_path, frames, fps=30, quality=9, macro_block_size=16)
-
-    print(
-        f"[EXPERT TEST] obstacles={num_obstacles}, "
-        f"reward={total_reward:.2f}, "
-        f"steps={step + 1}, "
-        f"progress={max_progress * 100:.2f}%, "
-        f"hit_obstacle={hit_obstacle}, "
-        f"off_track={off_track}"
-    )
-
-    return max_progress, off_track, hit_obstacle
-
-
-def warmup_replay_buffer(stacker, replay_buffer, steps=WARMUP_STEPS):
-    print(f"[WARMUP] Collecting {steps} expert steps...")
+    obs, info = env.reset(seed=SEED)
+    state = stacker.reset(obs)
 
     collected = 0
     episode_seed = SEED
 
-    # Mostly clean driving first.
-    warmup_choices = [0, 0, 0, 0, 2, 2, 6]
-
-    env = make_env(num_obstacles=random.choice(warmup_choices), debug=False)
-    obs, info = env.reset(seed=episode_seed)
-    state = stacker.reset(obs)
-
     while collected < steps:
-        action = simple_centerline_action(env)
-
-        # Very small expert noise only.
-        action = action + np.array([
-            np.random.normal(0.0, 0.015),
-            np.random.normal(0.0, 0.01),
-            np.random.normal(0.0, 0.005),
-        ], dtype=np.float32)
-
-        action = clip_action(action)
+        expert_action = simple_centerline_action(env)
+        action_index = closest_action_index(expert_action)
+        action = ACTIONS[action_index]
 
         next_obs, reward, terminated, truncated, info = env.step(action)
         next_state = stacker.step(next_obs)
 
         done = terminated or truncated
 
-        replay_buffer.push(state, action, reward, next_state, done)
+        replay_buffer.push(state, action_index, reward, next_state, done)
 
         state = next_state
         collected += 1
 
         if done:
-            env.close()
             episode_seed += 1
-            env = make_env(num_obstacles=random.choice(warmup_choices), debug=False)
             obs, info = env.reset(seed=episode_seed)
             state = stacker.reset(obs)
 
-    env.close()
     print(f"[WARMUP] Done. Buffer size: {len(replay_buffer)}")
 
 
-def pretrain_actor_bc(agent, replay_buffer, steps=BC_STEPS):
-    print(f"[BC] Pretraining actor for {steps} steps from expert replay...")
-
-    last_loss = None
-
-    for i in range(1, steps + 1):
-        last_loss = agent.behavior_clone_step(replay_buffer)
-
-        if i % 500 == 0:
-            print(f"[BC] step={i}, loss={last_loss}")
-
-    print(f"[BC] Done. Final loss={last_loss}")
-
-
 def train():
+    env = make_env(debug=False)
     stacker = FrameStack(FRAME_STACK)
-    agent = TD3Agent()
+
+    agent = DQNAgent()
     replay_buffer = ReplayBuffer(BUFFER_SIZE)
 
-    # First test expert. If this is bad, RL will be bad too.
-    evaluate_expert(num_obstacles=0, seed=SEED, max_steps=1000, video_path="debug_expert_no_obstacles.mp4")
-    evaluate_expert(num_obstacles=12, seed=SEED, max_steps=1000, video_path="debug_expert_12_obstacles.mp4")
-
-    warmup_replay_buffer(stacker, replay_buffer)
-    pretrain_actor_bc(agent, replay_buffer)
+    warmup_replay_buffer(env, stacker, replay_buffer)
 
     best_score = -float("inf")
     global_step = 0
 
     for episode in range(1, TOTAL_EPISODES + 1):
-        obstacle_count = curriculum_obstacle_count(episode)
-        env = make_env(num_obstacles=obstacle_count, debug=False)
-
         episode_seed = SEED + episode
 
         obs, info = env.reset(seed=episode_seed)
@@ -1092,8 +855,7 @@ def train():
         episode_reward = 0.0
         hit_obstacle = False
         off_track = False
-        last_critic_loss = None
-        last_actor_loss = None
+        last_loss = None
         lap_complete = False
         max_progress = 0.0
 
@@ -1103,21 +865,15 @@ def train():
         for step in range(MAX_STEPS):
             global_step += 1
 
-            # Early phase: mostly cloned policy, small expert fallback chance.
-            if global_step < START_LEARNING_AFTER:
-                if random.random() < 0.70:
-                    action = simple_centerline_action(env)
-                else:
-                    action = agent.select_action(state, training=True)
-            else:
-                action = agent.select_action(state, training=True)
+            action_index = agent.select_action(state, training=True)
+            action = ACTIONS[action_index]
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_state = stacker.step(next_obs)
 
             done = terminated or truncated
 
-            replay_buffer.push(state, action, reward, next_state, done)
+            replay_buffer.push(state, action_index, reward, next_state, done)
 
             state = next_state
             episode_reward += reward
@@ -1129,11 +885,11 @@ def train():
             if info.get("lap_complete", False):
                 lap_complete = True
 
-            if global_step > 1000 and global_step % TRAIN_EVERY == 0:
-                last_critic_loss, maybe_actor_loss = agent.train_step(replay_buffer)
+            if global_step > START_LEARNING_AFTER and global_step % TRAIN_EVERY == 0:
+                last_loss = agent.train_step(replay_buffer)
 
-                if maybe_actor_loss is not None:
-                    last_actor_loss = maybe_actor_loss
+            if global_step % TARGET_UPDATE_EVERY == 0:
+                agent.update_target()
 
             if info.get("hit_obstacle", False):
                 hit_obstacle = True
@@ -1144,44 +900,44 @@ def train():
             if done:
                 break
 
-        env.close()
-
         avg_lateral = lateral_sum / max(1, step + 1)
         avg_speed = speed_sum / max(1, step + 1)
 
-        score_for_saving = episode_reward + 1000.0 * max_progress
+        # Save based mainly on progress, but still include reward.
+        # This avoids saving a car that survives but barely moves.
+        score_for_saving = episode_reward + 700.0 * max_progress
 
         if score_for_saving > best_score and not off_track:
             best_score = score_for_saving
             agent.save(MODEL_PATH)
 
         if lap_complete and not off_track:
-            print("[SUCCESS] Lap completed. Saving successful TD3 model.")
+            print("[SUCCESS] Lap completed. Saving successful model.")
             agent.save(MODEL_PATH)
 
         print(
             f"Episode {episode:04d} | "
-            f"Obs: {obstacle_count:2d} | "
             f"Reward: {episode_reward:8.2f} | "
             f"BestScore: {best_score:8.2f} | "
             f"Steps: {step + 1:4d} | "
             f"Progress: {max_progress * 100:6.2f}% | "
             f"LapDone: {lap_complete} | "
-            f"Noise: {agent.exploration_noise():.3f} | "
+            f"Epsilon: {agent.epsilon():.3f} | "
             f"Hit: {hit_obstacle} | "
             f"OffTrack: {off_track} | "
             f"AvgLat: {avg_lateral:.2f} | "
             f"AvgSpeed: {avg_speed:.2f} | "
             f"Buffer: {len(replay_buffer)} | "
-            f"CriticLoss: {last_critic_loss} | "
-            f"ActorLoss: {last_actor_loss}"
+            f"Loss: {last_loss}"
         )
+
+    env.close()
 
     if best_score == -float("inf"):
         print("[WARNING] No best model was saved. Saving final model instead.")
         agent.save(MODEL_PATH)
 
-    print(f"Training complete. Best TD3 model saved to {MODEL_PATH}")
+    print(f"Training complete. Best model saved to {MODEL_PATH}")
 
 
 def upscale_frames(frames, scale=4):
@@ -1200,16 +956,61 @@ def upscale_frames(frames, scale=4):
     return high_quality
 
 
-def record_trained_video(video_path=VIDEO_PATH, num_obstacles=12):
+def record_debug_video(video_path="debug_visible_obstacles_v2.mp4"):
+    env = make_env(debug=True)
+    frames = []
+
+    obs, info = env.reset(seed=SEED)
+
+    total_reward = 0.0
+    hit_obstacle = False
+    off_track = False
+    max_progress = 0.0
+
+    for step in range(900):
+        action = simple_centerline_action(env)
+        obs, reward, terminated, truncated, info = env.step(action)
+
+        frame = env.render()
+        frames.append(frame)
+
+        total_reward += reward
+        max_progress = max(max_progress, info.get("progress", 0.0))
+
+        if info.get("hit_obstacle", False):
+            hit_obstacle = True
+
+        if info.get("off_track_terminated", False):
+            off_track = True
+
+        if terminated or truncated:
+            break
+
+    env.close()
+
+    frames = upscale_frames(frames, scale=4)
+    imageio.mimsave(video_path, frames, fps=30, quality=9, macro_block_size=16)
+
+    print(
+        f"[DEBUG VIDEO] reward={total_reward:.2f}, "
+        f"steps={step + 1}, "
+        f"progress={max_progress * 100:.2f}%, "
+        f"hit_obstacle={hit_obstacle}, "
+        f"off_track={off_track}"
+    )
+    print(f"Saved debug video to {video_path}")
+
+
+def record_trained_video(video_path=VIDEO_PATH):
     if not os.path.exists(MODEL_PATH):
         print(f"[WARNING] Model file not found: {MODEL_PATH}")
         print("[WARNING] Skipping trained video.")
         return
 
-    env = make_env(num_obstacles=num_obstacles, debug=True)
+    env = make_env(debug=True)
     stacker = FrameStack(FRAME_STACK)
 
-    agent = TD3Agent()
+    agent = DQNAgent()
     agent.load(MODEL_PATH)
 
     frames = []
@@ -1224,7 +1025,8 @@ def record_trained_video(video_path=VIDEO_PATH, num_obstacles=12):
     lap_complete = False
 
     for step in range(MAX_STEPS):
-        action = agent.select_action(state, training=False)
+        action_index = agent.select_action(state, training=False)
+        action = ACTIONS[action_index]
 
         obs, reward, terminated, truncated, info = env.step(action)
         state = stacker.step(obs)
@@ -1260,7 +1062,6 @@ def record_trained_video(video_path=VIDEO_PATH, num_obstacles=12):
         f"hit_obstacle={hit_obstacle}, "
         f"off_track={off_track}"
     )
-
     print(f"Saved trained video to {video_path}")
 
 
@@ -1269,5 +1070,6 @@ if __name__ == "__main__":
 
     print("Using device:", DEVICE)
 
+    record_debug_video()
     train()
     record_trained_video()
