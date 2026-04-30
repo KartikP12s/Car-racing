@@ -1,10 +1,11 @@
-# car_racing_obstacles_dqn_fixed_visible_v2.py
+# car_racing_obstacles_dqn_fixed_visible_v3.py
 
 import os
 import cv2
 import gymnasium as gym
 import imageio
 import random
+import json
 import numpy as np
 from collections import deque
 
@@ -22,7 +23,7 @@ SEED = 7
 FRAME_STACK = 4
 IMAGE_SIZE = 84
 
-TOTAL_EPISODES = 400
+TOTAL_EPISODES = 100
 MAX_STEPS = 2000
 
 BATCH_SIZE = 32
@@ -39,12 +40,17 @@ EPSILON_START = 0.35
 EPSILON_END = 0.03
 EPSILON_DECAY_STEPS = 120_000
 
-MODEL_PATH = "dqn_carracing_visible_obstacles_v2.pt"
-VIDEO_PATH = "dqn_visible_obstacles_run_v2.mp4"
+MODEL_PATH = "dqn_carracing_visible_obstacles_v3.pt"
+VIDEO_PATH = "dqn_visible_obstacles_run_v3.mp4"
+
+# This is the important one.
+# This video is saved from the actual best training episode frames.
+BEST_EPISODE_VIDEO_PATH = "best_episode_dqn_visible_obstacles_v3.mp4"
+BEST_METADATA_PATH = "best_episode_metadata_v3.json"
 
 
-# DQN still chooses from fixed continuous actions.
-# Expanded slightly, but still safe/smooth. Obstacles are unchanged.
+# DQN chooses from a fixed discrete list of continuous CarRacing actions.
+# Each action is still [steering, gas, brake].
 ACTIONS = [
     np.array([0.00, 0.36, 0.00], dtype=np.float32),
     np.array([0.00, 0.24, 0.00], dtype=np.float32),
@@ -132,6 +138,10 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         self.collision_cooldown = 0
         self.prev_progress = 0.0
 
+        # Prevent reward explosion near the finish line.
+        self.near_finish_bonus_given = False
+        self.lap_bonus_given = False
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
 
@@ -141,10 +151,14 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         self.collision_cooldown = 0
         self.prev_progress = 0.0
 
+        # Reset one-time finish bonuses every episode.
+        self.near_finish_bonus_given = False
+        self.lap_bonus_given = False
+
         self._spawn_fixed_world_obstacles()
         self._add_obstacles_to_road_render()
 
-        # Important: return rendered frame after adding visible obstacles.
+        # Return rendered frame after adding visible obstacles.
         obs = self.env.render()
 
         if self.debug:
@@ -175,8 +189,10 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         progress = self._track_progress()
 
         progress_delta = progress - self.prev_progress
+
         if progress_delta < -0.50:
             progress_delta = 0.0
+
         progress_delta = max(0.0, progress_delta)
         self.prev_progress = progress
 
@@ -187,15 +203,22 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         info["speed"] = speed
         info["heading_error"] = heading_error
         info["progress"] = progress
+        info["progress_delta"] = progress_delta
         info["lap_complete"] = progress >= 0.95
         info["hit_obstacle"] = False
         info["off_track_terminated"] = False
 
-        # Reward real progress directly. This is the main fix.
+        # Start with original Gymnasium CarRacing reward.
+        # Base env already gives:
+        # -0.1 per frame
+        # +1000 / total_tiles for each new visited tile
+        reward = float(reward)
+
+        # Small custom progress shaping.
         reward += 3.0 * progress_delta
 
-        # Collision should hurt, but should not instantly end training every time.
-        # Cooldown prevents one collision from applying the penalty on 20 frames in a row.
+        # Obstacle collision penalty.
+        # Cooldown prevents one crash from applying penalty every frame.
         if self.collision_cooldown > 0:
             self.collision_cooldown -= 1
 
@@ -206,7 +229,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         else:
             reward += self.obstacle_step_penalty
 
-        # Give recovery chance instead of instant death.
+        # Off-track recovery logic.
         if lateral > 3.25:
             self.offtrack_counter += 1
             reward -= 2.0
@@ -221,7 +244,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             terminated = True
             info["off_track_terminated"] = True
 
-        # Centering reward: not too strict, but encourages stable driving.
+        # Centering reward.
         if lateral < 1.20:
             reward += 0.04
         elif lateral < 2.00:
@@ -235,7 +258,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif heading_error > 0.95:
             reward -= 0.20
 
-        # Speed shaping. Softer than before because high speed was over-punished.
+        # Speed shaping.
         if 8.0 <= speed <= 30.0:
             reward += 0.025
         elif 30.0 < speed <= 42.0:
@@ -245,16 +268,22 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif speed < 2.5:
             reward -= 0.03
 
-        # Slow down near obstacles, but do not make the agent scared to move.
+        # Slow down near obstacles.
         near_ob = self.nearest_forward_obstacle(lookahead=22)
+
         if near_ob is not None and speed > 32.0:
             reward -= 0.15
 
-        if progress >= 0.90:
-            reward += 1.0
+        # IMPORTANT FIX:
+        # These bonuses are now one-time only.
+        # Before, +100 was being added every frame after 95%.
+        if progress >= 0.90 and not self.near_finish_bonus_given:
+            reward += 10.0
+            self.near_finish_bonus_given = True
 
-        if progress >= 0.95:
+        if progress >= 0.95 and not self.lap_bonus_given:
             reward += 100.0
+            self.lap_bonus_given = True
             info["lap_complete"] = True
 
         return obs, reward, terminated, truncated, info
@@ -277,7 +306,6 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         obstacle_indices = np.linspace(start, end, self.num_obstacles, dtype=int)
 
-        # Kept exactly the same obstacle offsets from your version.
         offset_pattern = [
             -1.15, 1.15,
             -1.35, 1.35,
@@ -298,7 +326,6 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             ox = x + offset * nx
             oy = y + offset * ny
 
-            # Avoid spawning obstacles too close to each other.
             too_close = False
 
             for px, py in used_positions:
@@ -356,8 +383,14 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             p1 = (bx - width * nx, by - width * ny)
             p2 = (bx + width * nx, by + width * ny)
 
-            q1 = (bx - width * 0.75 * (tx + nx), by - width * 0.75 * (ty + ny))
-            q2 = (bx + width * 0.75 * (tx + nx), by + width * 0.75 * (ty + ny))
+            q1 = (
+                bx - width * 0.75 * (tx + nx),
+                by - width * 0.75 * (ty + ny),
+            )
+            q2 = (
+                bx + width * 0.75 * (tx + nx),
+                by + width * 0.75 * (ty + ny),
+            )
 
             segments.append(([p1, p2], (25, 25, 25)))
             segments.append(([q1, q2], (25, 25, 25)))
@@ -749,7 +782,6 @@ def simple_centerline_action(env):
     # Strong center recovery before grass.
     if lateral_signed > 1.55:
         steering -= 0.35
-
     elif lateral_signed < -1.55:
         steering += 0.35
 
@@ -786,20 +818,50 @@ def simple_centerline_action(env):
     if obstacle_close:
         gas = 0.14
         brake = 0.10
-
     elif abs(steering) < 0.12:
         gas = 0.34
         brake = 0.00
-
     elif abs(steering) < 0.32:
         gas = 0.24
         brake = 0.02
-
     else:
         gas = 0.12
         brake = 0.08
 
     return np.array([steering, gas, brake], dtype=np.float32)
+
+
+def upscale_frames(frames, scale=4):
+    high_quality = []
+
+    for frame in frames:
+        enlarged = cv2.resize(
+            frame,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        high_quality.append(enlarged)
+
+    return high_quality
+
+
+def save_video(frames, path, fps=30, scale=4):
+    if len(frames) == 0:
+        print(f"[WARNING] No frames to save for {path}")
+        return
+
+    frames = upscale_frames(frames, scale=scale)
+    imageio.mimsave(path, frames, fps=fps, quality=9, macro_block_size=16)
+    print(f"[VIDEO SAVE] Saved video to {path}")
+
+
+def save_best_metadata(metadata, path=BEST_METADATA_PATH):
+    with open(path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"[METADATA SAVE] Saved best episode metadata to {path}")
 
 
 def warmup_replay_buffer(env, stacker, replay_buffer, steps=WARMUP_STEPS):
@@ -826,12 +888,71 @@ def warmup_replay_buffer(env, stacker, replay_buffer, steps=WARMUP_STEPS):
         state = next_state
         collected += 1
 
+        if collected % 5000 == 0:
+            print(f"[WARMUP] collected={collected}/{steps}")
+
         if done:
             episode_seed += 1
             obs, info = env.reset(seed=episode_seed)
             state = stacker.reset(obs)
 
     print(f"[WARMUP] Done. Buffer size: {len(replay_buffer)}")
+
+
+def should_save_episode(
+    episode_reward,
+    max_progress,
+    lap_complete,
+    hit_obstacle,
+    off_track,
+    best_progress,
+    best_clean_progress,
+):
+    """
+    Saving policy:
+    1. Never save off-track episodes.
+    2. Prefer clean episodes: no obstacle hit and no off-track.
+    3. Save clean lap completion.
+    4. Save better clean progress.
+    5. Allow hit episodes only if progress is much better than previous best.
+    """
+
+    clean_episode = (not off_track) and (not hit_obstacle)
+    valid_episode = not off_track
+
+    save_score = (
+        10000.0 * max_progress
+        + episode_reward
+        - (500.0 if hit_obstacle else 0.0)
+        - (2000.0 if off_track else 0.0)
+    )
+
+    should_save = False
+    save_reason = ""
+
+    if not valid_episode:
+        return False, "not saved: off-track", save_score
+
+    # Best possible case.
+    if lap_complete and clean_episode:
+        should_save = True
+        save_reason = "clean lap complete"
+
+    # Clean progress should be saved aggressively.
+    elif clean_episode and max_progress > best_clean_progress:
+        should_save = True
+        save_reason = "best clean progress"
+
+    # If hit happened, only save when it is clearly much better.
+    # This prevents random hit episodes from replacing clean progress.
+    elif valid_episode and max_progress > best_progress + 0.10:
+        should_save = True
+        save_reason = "best progress with hit"
+
+    else:
+        save_reason = "not saved: no improvement"
+
+    return should_save, save_reason, save_score
 
 
 def train():
@@ -844,6 +965,10 @@ def train():
     warmup_replay_buffer(env, stacker, replay_buffer)
 
     best_score = -float("inf")
+    best_progress = 0.0
+    best_clean_progress = 0.0
+    best_episode = None
+
     global_step = 0
 
     for episode in range(1, TOTAL_EPISODES + 1):
@@ -851,6 +976,11 @@ def train():
 
         obs, info = env.reset(seed=episode_seed)
         state = stacker.reset(obs)
+
+        # Store frames from THIS episode.
+        # If this episode becomes best, these exact frames get saved.
+        episode_frames = []
+        episode_frames.append(obs.copy())
 
         episode_reward = 0.0
         hit_obstacle = False
@@ -862,14 +992,20 @@ def train():
         lateral_sum = 0.0
         speed_sum = 0.0
 
+        action_counts = np.zeros(NUM_ACTIONS, dtype=np.int32)
+
         for step in range(MAX_STEPS):
             global_step += 1
 
             action_index = agent.select_action(state, training=True)
             action = ACTIONS[action_index]
+            action_counts[action_index] += 1
 
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_state = stacker.step(next_obs)
+
+            # Store actual frame from training episode.
+            episode_frames.append(next_obs.copy())
 
             done = terminated or truncated
 
@@ -903,22 +1039,77 @@ def train():
         avg_lateral = lateral_sum / max(1, step + 1)
         avg_speed = speed_sum / max(1, step + 1)
 
-        # Save based mainly on progress, but still include reward.
-        # This avoids saving a car that survives but barely moves.
-        score_for_saving = episode_reward + 700.0 * max_progress
+        should_save, save_reason, save_score = should_save_episode(
+            episode_reward=episode_reward,
+            max_progress=max_progress,
+            lap_complete=lap_complete,
+            hit_obstacle=hit_obstacle,
+            off_track=off_track,
+            best_progress=best_progress,
+            best_clean_progress=best_clean_progress,
+        )
 
-        if score_for_saving > best_score and not off_track:
-            best_score = score_for_saving
+        if should_save:
+            best_score = save_score
+            best_progress = max(best_progress, max_progress)
+
+            if not hit_obstacle and not off_track:
+                best_clean_progress = max(best_clean_progress, max_progress)
+
+            best_episode = episode
+
             agent.save(MODEL_PATH)
 
-        if lap_complete and not off_track:
-            print("[SUCCESS] Lap completed. Saving successful model.")
-            agent.save(MODEL_PATH)
+            # IMPORTANT FIX:
+            # Save the exact episode that caused the model save.
+            save_video(
+                episode_frames,
+                BEST_EPISODE_VIDEO_PATH,
+                fps=30,
+                scale=4,
+            )
+
+            metadata = {
+                "episode": episode,
+                "seed": episode_seed,
+                "reward": episode_reward,
+                "save_score": save_score,
+                "progress_percent": max_progress * 100.0,
+                "lap_complete": lap_complete,
+                "hit_obstacle": hit_obstacle,
+                "off_track": off_track,
+                "steps": step + 1,
+                "avg_lateral": avg_lateral,
+                "avg_speed": avg_speed,
+                "epsilon": agent.epsilon(),
+                "save_reason": save_reason,
+                "model_path": MODEL_PATH,
+                "best_episode_video_path": BEST_EPISODE_VIDEO_PATH,
+                "action_counts": action_counts.tolist(),
+            }
+
+            save_best_metadata(metadata)
+
+            print(
+                f"[SAVE] reason={save_reason} | "
+                f"episode={episode} | "
+                f"seed={episode_seed} | "
+                f"progress={max_progress * 100:.2f}% | "
+                f"reward={episode_reward:.2f} | "
+                f"save_score={save_score:.2f} | "
+                f"hit={hit_obstacle} | "
+                f"offtrack={off_track} | "
+                f"best_video={BEST_EPISODE_VIDEO_PATH}"
+            )
 
         print(
             f"Episode {episode:04d} | "
             f"Reward: {episode_reward:8.2f} | "
+            f"SaveScore: {save_score:8.2f} | "
             f"BestScore: {best_score:8.2f} | "
+            f"BestProg: {best_progress * 100:6.2f}% | "
+            f"BestCleanProg: {best_clean_progress * 100:6.2f}% | "
+            f"BestEp: {best_episode} | "
             f"Steps: {step + 1:4d} | "
             f"Progress: {max_progress * 100:6.2f}% | "
             f"LapDone: {lap_complete} | "
@@ -928,39 +1119,28 @@ def train():
             f"AvgLat: {avg_lateral:.2f} | "
             f"AvgSpeed: {avg_speed:.2f} | "
             f"Buffer: {len(replay_buffer)} | "
-            f"Loss: {last_loss}"
+            f"Loss: {last_loss} | "
+            f"SaveDecision: {save_reason}"
         )
 
     env.close()
 
-    if best_score == -float("inf"):
-        print("[WARNING] No best model was saved. Saving final model instead.")
+    if best_episode is None:
+        print("[WARNING] No good model was saved. Saving final model instead.")
         agent.save(MODEL_PATH)
 
-    print(f"Training complete. Best model saved to {MODEL_PATH}")
+    print(f"Training complete.")
+    print(f"Best model saved to: {MODEL_PATH}")
+    print(f"Best episode video saved to: {BEST_EPISODE_VIDEO_PATH}")
+    print(f"Best metadata saved to: {BEST_METADATA_PATH}")
 
 
-def upscale_frames(frames, scale=4):
-    high_quality = []
-
-    for frame in frames:
-        enlarged = cv2.resize(
-            frame,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
-        high_quality.append(enlarged)
-
-    return high_quality
-
-
-def record_debug_video(video_path="debug_visible_obstacles_v2.mp4"):
+def record_debug_video(video_path="debug_visible_obstacles_v3.mp4"):
     env = make_env(debug=True)
     frames = []
 
     obs, info = env.reset(seed=SEED)
+    frames.append(obs.copy())
 
     total_reward = 0.0
     hit_obstacle = False
@@ -971,8 +1151,7 @@ def record_debug_video(video_path="debug_visible_obstacles_v2.mp4"):
         action = simple_centerline_action(env)
         obs, reward, terminated, truncated, info = env.step(action)
 
-        frame = env.render()
-        frames.append(frame)
+        frames.append(obs.copy())
 
         total_reward += reward
         max_progress = max(max_progress, info.get("progress", 0.0))
@@ -988,8 +1167,7 @@ def record_debug_video(video_path="debug_visible_obstacles_v2.mp4"):
 
     env.close()
 
-    frames = upscale_frames(frames, scale=4)
-    imageio.mimsave(video_path, frames, fps=30, quality=9, macro_block_size=16)
+    save_video(frames, video_path, fps=30, scale=4)
 
     print(
         f"[DEBUG VIDEO] reward={total_reward:.2f}, "
@@ -998,10 +1176,18 @@ def record_debug_video(video_path="debug_visible_obstacles_v2.mp4"):
         f"hit_obstacle={hit_obstacle}, "
         f"off_track={off_track}"
     )
-    print(f"Saved debug video to {video_path}")
 
 
-def record_trained_video(video_path=VIDEO_PATH):
+def record_trained_video(video_path=VIDEO_PATH, seed=SEED):
+    """
+    This re-runs the saved model.
+    Important: this is NOT guaranteed to look exactly like the best training episode,
+    because it is a fresh rollout.
+
+    The actual best episode video is saved during training as:
+    BEST_EPISODE_VIDEO_PATH
+    """
+
     if not os.path.exists(MODEL_PATH):
         print(f"[WARNING] Model file not found: {MODEL_PATH}")
         print("[WARNING] Skipping trained video.")
@@ -1015,8 +1201,10 @@ def record_trained_video(video_path=VIDEO_PATH):
 
     frames = []
 
-    obs, info = env.reset(seed=SEED)
+    obs, info = env.reset(seed=seed)
     state = stacker.reset(obs)
+
+    frames.append(obs.copy())
 
     total_reward = 0.0
     hit_obstacle = False
@@ -1024,15 +1212,17 @@ def record_trained_video(video_path=VIDEO_PATH):
     max_progress = 0.0
     lap_complete = False
 
+    action_counts = np.zeros(NUM_ACTIONS, dtype=np.int32)
+
     for step in range(MAX_STEPS):
         action_index = agent.select_action(state, training=False)
         action = ACTIONS[action_index]
+        action_counts[action_index] += 1
 
         obs, reward, terminated, truncated, info = env.step(action)
         state = stacker.step(obs)
 
-        frame = env.render()
-        frames.append(frame)
+        frames.append(obs.copy())
 
         total_reward += reward
         max_progress = max(max_progress, info.get("progress", 0.0))
@@ -1051,18 +1241,20 @@ def record_trained_video(video_path=VIDEO_PATH):
 
     env.close()
 
-    frames = upscale_frames(frames, scale=4)
-    imageio.mimsave(video_path, frames, fps=30, quality=9, macro_block_size=16)
+    save_video(frames, video_path, fps=30, scale=4)
 
     print(
-        f"[VIDEO] reward={total_reward:.2f}, "
+        f"[VIDEO REPLAY] reward={total_reward:.2f}, "
         f"steps={step + 1}, "
         f"progress={max_progress * 100:.2f}%, "
         f"lap_complete={lap_complete}, "
         f"hit_obstacle={hit_obstacle}, "
-        f"off_track={off_track}"
+        f"off_track={off_track}, "
+        f"seed={seed}"
     )
-    print(f"Saved trained video to {video_path}")
+
+    print(f"Saved trained replay video to {video_path}")
+    print(f"Actual best training episode video is: {BEST_EPISODE_VIDEO_PATH}")
 
 
 if __name__ == "__main__":
@@ -1072,4 +1264,7 @@ if __name__ == "__main__":
 
     record_debug_video()
     train()
+
+    # This is just a replay of the saved model.
+    # The real best episode video is saved during training.
     record_trained_video()
