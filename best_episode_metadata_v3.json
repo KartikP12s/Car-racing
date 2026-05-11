@@ -1,0 +1,32 @@
+{
+  "episode": 151,
+  "seed": 158,
+  "reward": 274.6149999999905,
+  "save_score": 6524.614999999991,
+  "progress_percent": 62.5,
+  "lap_complete": false,
+  "hit_obstacle": false,
+  "off_track": false,
+  "steps": 1000,
+  "avg_lateral": 0.8833352803076076,
+  "avg_speed": 43.59195861944532,
+  "epsilon": 0.24366559999999995,
+  "save_reason": "best clean progress",
+  "model_path": "dqn_carracing_visible_obstacles_v3.pt",
+  "best_episode_video_path": "best_episode_dqn_visible_obstacles_v3.mp4",
+  "action_counts": [
+    100,
+    89,
+    38,
+    196,
+    97,
+    35,
+    75,
+    73,
+    50,
+    77,
+    66,
+    59,
+    45
+  ]
+}

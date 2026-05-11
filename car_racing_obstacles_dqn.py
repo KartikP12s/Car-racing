@@ -23,11 +23,11 @@ SEED = 7
 FRAME_STACK = 4
 IMAGE_SIZE = 84
 
-TOTAL_EPISODES = 100
+TOTAL_EPISODES = 200
 MAX_STEPS = 2000
 
-BATCH_SIZE = 32
-BUFFER_SIZE = 80_000
+BATCH_SIZE = 64
+BUFFER_SIZE = 50_000
 GAMMA = 0.99
 LR = 1e-4
 
@@ -38,9 +38,10 @@ TARGET_UPDATE_EVERY = 1000
 
 EPSILON_START = 0.35
 EPSILON_END = 0.03
-EPSILON_DECAY_STEPS = 120_000
+EPSILON_DECAY_STEPS = 200_000
 
 MODEL_PATH = "dqn_carracing_visible_obstacles_v3.pt"
+RESUME_TRAINING = True
 VIDEO_PATH = "dqn_visible_obstacles_run_v3.mp4"
 
 # This is the important one.
@@ -122,6 +123,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         obstacle_radius=0.32,
         collision_penalty=-35.0,
         obstacle_step_penalty=-0.0005,
+        collision_terminate=False,
         debug=False,
     ):
         super().__init__(env)
@@ -130,6 +132,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         self.obstacle_radius = obstacle_radius
         self.collision_penalty = collision_penalty
         self.obstacle_step_penalty = obstacle_step_penalty
+        self.collision_terminate = collision_terminate
         self.debug = debug
 
         self.obstacles = []
@@ -141,6 +144,15 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         # Prevent reward explosion near the finish line.
         self.near_finish_bonus_given = False
         self.lap_bonus_given = False
+
+        # One-time milestone bonuses.
+        self.milestone_25_given = False
+        self.milestone_50_given = False
+        self.milestone_75_given = False
+
+        # Stall detection: terminate if no progress for too long.
+        self.stall_counter = 0
+        self.stall_best_progress = 0.0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
@@ -154,6 +166,11 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         # Reset one-time finish bonuses every episode.
         self.near_finish_bonus_given = False
         self.lap_bonus_given = False
+        self.milestone_25_given = False
+        self.milestone_50_given = False
+        self.milestone_75_given = False
+        self.stall_counter = 0
+        self.stall_best_progress = 0.0
 
         self._spawn_fixed_world_obstacles()
         self._add_obstacles_to_road_render()
@@ -226,6 +243,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             reward += self.collision_penalty
             self.collision_cooldown = 20
             info["hit_obstacle"] = True
+            if self.collision_terminate:
+                terminated = True
         else:
             reward += self.obstacle_step_penalty
 
@@ -258,6 +277,13 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif heading_error > 0.95:
             reward -= 0.20
 
+        # Forward direction shaping: penalize driving backward along the track.
+        forward_align = self._forward_velocity_alignment()
+        if forward_align < -0.3:
+            reward -= 0.50
+        elif forward_align < 0.0:
+            reward -= 0.10
+
         # Speed shaping.
         if 8.0 <= speed <= 30.0:
             reward += 0.025
@@ -266,13 +292,37 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif speed > 42.0:
             reward -= 0.12
         elif speed < 2.5:
-            reward -= 0.03
+            reward -= 0.30
+
+        # Stall detection: penalise and terminate if stuck with no progress.
+        if progress > self.stall_best_progress + 0.001:
+            self.stall_best_progress = progress
+            self.stall_counter = 0
+        else:
+            self.stall_counter += 1
+
+        if self.stall_counter >= 200:
+            reward -= 20.0
+            terminated = True
 
         # Slow down near obstacles.
         near_ob = self.nearest_forward_obstacle(lookahead=22)
 
         if near_ob is not None and speed > 32.0:
             reward -= 0.15
+
+        # One-time milestone bonuses to densify the reward signal.
+        if progress >= 0.25 and not self.milestone_25_given:
+            reward += 8.0
+            self.milestone_25_given = True
+
+        if progress >= 0.50 and not self.milestone_50_given:
+            reward += 8.0
+            self.milestone_50_given = True
+
+        if progress >= 0.75 and not self.milestone_75_given:
+            reward += 8.0
+            self.milestone_75_given = True
 
         # IMPORTANT FIX:
         # These bonuses are now one-time only.
@@ -306,13 +356,6 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         obstacle_indices = np.linspace(start, end, self.num_obstacles, dtype=int)
 
-        offset_pattern = [
-            -1.15, 1.15,
-            -1.35, 1.35,
-            -0.95, 0.95,
-            -1.25, 1.25,
-        ]
-
         used_positions = []
 
         for k, idx in enumerate(obstacle_indices):
@@ -321,6 +364,12 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             nx = -np.sin(beta)
             ny = np.cos(beta)
 
+            offset_pattern = [
+                -1.15, 1.15,
+                -1.35, 1.35,
+                -0.95, 0.95,
+                -1.25, 1.25,
+            ]
             offset = offset_pattern[k % len(offset_pattern)]
 
             ox = x + offset * nx
@@ -517,6 +566,33 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         return float(diff)
 
+    def _forward_velocity_alignment(self):
+        base = self.env.unwrapped
+        car = getattr(base, "car", None)
+        track = getattr(base, "track", None)
+
+        if car is None or track is None or len(track) == 0:
+            return 0.0
+
+        idx = self._nearest_track_index()
+
+        if idx is None:
+            return 0.0
+
+        _, beta, _, _ = track[idx]
+
+        # Track forward direction vector.
+        tx = np.cos(beta)
+        ty = np.sin(beta)
+
+        v = car.hull.linearVelocity
+        speed = float(np.sqrt(v[0] ** 2 + v[1] ** 2))
+
+        if speed < 0.5:
+            return 0.0
+
+        return float((v[0] * tx + v[1] * ty) / speed)
+
     def _car_speed(self):
         base = self.env.unwrapped
         car = getattr(base, "car", None)
@@ -593,16 +669,20 @@ class ReplayBuffer:
     def push(self, state, action_index, reward, next_state, done):
         # Small clipping prevents very large target spikes.
         reward = float(np.clip(reward, -50.0, 50.0))
-        self.buffer.append((state, action_index, reward, next_state, float(done)))
+        # Store as uint8 (0-255) to use 4x less memory than float32.
+        state_u8 = (state * 255.0).clip(0, 255).astype(np.uint8)
+        next_state_u8 = (next_state * 255.0).clip(0, 255).astype(np.uint8)
+        self.buffer.append((state_u8, action_index, reward, next_state_u8, float(done)))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        states = torch.tensor(np.array(states), dtype=torch.float32).to(DEVICE)
+        # Convert uint8 back to float32 in [0, 1] at sample time.
+        states = torch.tensor(np.array(states), dtype=torch.float32).div(255.0).to(DEVICE)
         actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(DEVICE)
         rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(DEVICE)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(DEVICE)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).div(255.0).to(DEVICE)
         dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(DEVICE)
 
         return states, actions, rewards, next_states, dones
@@ -732,6 +812,7 @@ def make_env(debug=False):
         obstacle_radius=0.32,
         collision_penalty=-35.0,
         obstacle_step_penalty=-0.0005,
+        collision_terminate=False,
         debug=debug,
     )
 
@@ -831,30 +912,24 @@ def simple_centerline_action(env):
     return np.array([steering, gas, brake], dtype=np.float32)
 
 
-def upscale_frames(frames, scale=4):
-    high_quality = []
-
-    for frame in frames:
-        enlarged = cv2.resize(
-            frame,
-            None,
-            fx=scale,
-            fy=scale,
-            interpolation=cv2.INTER_CUBIC,
-        )
-        high_quality.append(enlarged)
-
-    return high_quality
-
-
 def save_video(frames, path, fps=30, scale=4):
     if len(frames) == 0:
         print(f"[WARNING] No frames to save for {path}")
         return
 
-    frames = upscale_frames(frames, scale=scale)
-    imageio.mimsave(path, frames, fps=fps, quality=9, macro_block_size=16)
-    print(f"[VIDEO SAVE] Saved video to {path}")
+    h, w = frames[0].shape[:2]
+    h_out = ((h * scale + 15) // 16) * 16
+    w_out = ((w * scale + 15) // 16) * 16
+
+    # Stream one frame at a time to avoid loading all upscaled frames into RAM.
+    with imageio.get_writer(path, fps=fps) as writer:
+        for frame in frames:
+            enlarged = cv2.resize(
+                frame, (w_out, h_out), interpolation=cv2.INTER_CUBIC
+            )
+            writer.append_data(enlarged)
+
+    print(f"[VIDEO SAVE] Saved {len(frames)} frames to {path}")
 
 
 def save_best_metadata(metadata, path=BEST_METADATA_PATH):
@@ -961,6 +1036,12 @@ def train():
 
     agent = DQNAgent()
     replay_buffer = ReplayBuffer(BUFFER_SIZE)
+
+    if RESUME_TRAINING and os.path.exists(MODEL_PATH):
+        agent.load(MODEL_PATH)
+        print(f"[RESUME] Loaded model from {MODEL_PATH} (steps_done={agent.steps_done}, epsilon={agent.epsilon():.3f})")
+    else:
+        print("[TRAIN] Starting from scratch.")
 
     warmup_replay_buffer(env, stacker, replay_buffer)
 
