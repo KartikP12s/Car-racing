@@ -71,8 +71,7 @@ HARD_OFFTRACK_LATERAL = 2.80
 TERMINAL_OFFTRACK_LATERAL = 3.25
 OFFTRACK_COUNTER_LIMIT = 12
 
-# DQN chooses from a fixed discrete list of continuous CarRacing actions.
-# Each action is [steering, gas, brake].
+# DQN chooses from a fixed discrete list of continuous CarRacing actions, with each action being one of the three: [steering, gas, brake].
 # Negative steer = left, positive steer = right.
 ACTIONS = [
     np.array([0.00, 0.32, 0.00], dtype=np.float32),
@@ -273,17 +272,15 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         reward = float(reward)
 
-        # -----------------------------
-        # 1. Progress reward / penalty
-        # -----------------------------
+    
+        # Progress reward / penalty
         reward += 8.0 * progress_delta
 
         if speed > 3.0 and progress_delta <= 0.00001:
             reward -= 0.04
 
-        # -----------------------------
-        # 2. Collision handling
-        # -----------------------------
+    
+        # Collision handling
         if hit:
             reward += self.collision_penalty
             info["hit_obstacle"] = True
@@ -300,9 +297,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         else:
             reward += self.obstacle_step_penalty
 
-        # -----------------------------
-        # 3. Off-track handling
-        # -----------------------------
+    
+        # Off-track handling
         if lateral > TERMINAL_OFFTRACK_LATERAL:
             self.offtrack_counter += 2
             reward -= 4.0
@@ -327,9 +323,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             if TERMINATE_ON_OFF_TRACK:
                 terminated = True
 
-        # -----------------------------
-        # 4. Centering reward
-        # -----------------------------
+        
+        # Centering reward
         if lateral < 0.90:
             reward += 0.08
         elif lateral < 1.40:
@@ -339,9 +334,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif lateral > 2.40:
             reward -= 0.25
 
-        # -----------------------------
-        # 5. Direction / wrong-way handling
-        # -----------------------------
+        
+        # Direction / wrong-way handling
         if wrong_way:
             self.wrong_way_counter += 1
             reward -= 1.0
@@ -364,17 +358,15 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif heading_dot < 0.0:
             reward -= 0.30
 
-        # -----------------------------
-        # 6. Heading error shaping
-        # -----------------------------
+       
+        # Heading error shaping
         if heading_error < 0.25:
             reward += 0.04
         elif heading_error > 0.95:
             reward -= 0.25
 
-        # -----------------------------
-        # 7. Speed shaping
-        # -----------------------------
+      
+        # Speed shaping
         # Safer speed range because obstacles exist.
         if 8.0 <= speed <= 26.0:
             reward += 0.04
@@ -385,9 +377,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         elif speed < 2.5:
             reward -= 0.04
 
-        # -----------------------------
-        # 8. Obstacle proximity handling
-        # -----------------------------
+    
+        # Obstacle proximity handling
         near_ob = self.nearest_forward_obstacle(lookahead=28)
 
         if near_ob is not None:
@@ -411,9 +402,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             info["nearest_obstacle_offset"] = None
             info["nearest_obstacle_track_index"] = None
 
-        # -----------------------------
-        # 9. One-time finish bonuses
-        # -----------------------------
+   
+        # One-time finish bonuses  
         if progress >= 0.90 and not self.near_finish_bonus_given:
             reward += 10.0
             self.near_finish_bonus_given = True
@@ -655,7 +645,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         forward_delta = (current_idx - self.prev_track_idx) % n
         backward_delta = (self.prev_track_idx - current_idx) % n
 
-        # If the car barely moved or nearest tile jitters, treat as neutral.
+        # If the car barely moved or nearest tile jitters, we treat it as neutral
         if forward_delta == 0 or min(forward_delta, backward_delta) <= 1:
             return 0, True
 
@@ -730,12 +720,12 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         _, beta, _, _ = track[idx]
 
-        # Car forward vector from hull angle.
+        # Car forward vector from hull angle
         car_angle = car.hull.angle
         car_fx = np.cos(car_angle)
         car_fy = np.sin(car_angle)
 
-        # Track forward vector.
+        # Track the forward vector
         track_fx = np.cos(beta)
         track_fy = np.sin(beta)
 
@@ -794,7 +784,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         for ob in self.obstacles:
             d = np.sqrt((car_x - ob["x"]) ** 2 + (car_y - ob["y"]) ** 2)
 
-            # Slightly bigger collision radius to avoid visually passing through obstacle.
+            # We use a slightly bigger collision radius to avoid visually passing through obstacles
             if d < CAR_COLLISION_RADIUS + ob["r"]:
                 return (True, ob) if return_obstacle else True
 
@@ -1496,6 +1486,5 @@ if __name__ == "__main__":
     record_debug_video()
     train()
 
-    # This is only a fresh replay of the saved model.
-    # The actual best episode video is saved during training.
+    # This is only a fresh replay of the saved model, the actual best episode video is saved during the training itself
     record_trained_video()
