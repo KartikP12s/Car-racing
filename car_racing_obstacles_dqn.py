@@ -1,4 +1,4 @@
-# car_racing_obstacles_dqn_fixed_visible_v3.py
+# car_racing_obstacles_dqn_fixed_visible_v4.py
 
 import os
 import cv2
@@ -23,11 +23,11 @@ SEED = 7
 FRAME_STACK = 4
 IMAGE_SIZE = 84
 
-TOTAL_EPISODES = 200
+TOTAL_EPISODES = 1000
 MAX_STEPS = 2000
 
-BATCH_SIZE = 64
-BUFFER_SIZE = 50_000
+BATCH_SIZE = 32
+BUFFER_SIZE = 80_000
 GAMMA = 0.99
 LR = 1e-4
 
@@ -38,39 +38,61 @@ TARGET_UPDATE_EVERY = 1000
 
 EPSILON_START = 0.35
 EPSILON_END = 0.03
-EPSILON_DECAY_STEPS = 200_000
+EPSILON_DECAY_STEPS = 120_000
 
-MODEL_PATH = "dqn_carracing_visible_obstacles_v3.pt"
-RESUME_TRAINING = True
-VIDEO_PATH = "dqn_visible_obstacles_run_v3.mp4"
+MODEL_PATH = "dqn_carracing_visible_obstacles_v4.pt"
+VIDEO_PATH = "dqn_visible_obstacles_run_v4.mp4"
 
-# This is the important one.
-# This video is saved from the actual best training episode frames.
-BEST_EPISODE_VIDEO_PATH = "best_episode_dqn_visible_obstacles_v3.mp4"
-BEST_METADATA_PATH = "best_episode_metadata_v3.json"
+BEST_EPISODE_VIDEO_PATH = "best_episode_dqn_visible_obstacles_v4.mp4"
+BEST_METADATA_PATH = "best_episode_metadata_v4.json"
 
+DEBUG_ENV = True
+DEBUG_EVERY = 50
+DEBUG_FIRST_STEPS = 250
+
+# Strong safety fixes
+TERMINATE_ON_OBSTACLE_HIT = True
+TERMINATE_ON_WRONG_WAY = True
+TERMINATE_ON_OFF_TRACK = True
+
+# Collision tuning
+CAR_COLLISION_RADIUS = 0.90
+OBSTACLE_RADIUS = 0.38
+COLLISION_PENALTY = -80.0
+
+# Wrong-way tuning
+WRONG_WAY_DOT_THRESHOLD = -0.25
+WRONG_WAY_COUNTER_LIMIT = 18
+BACKWARD_INDEX_COUNTER_LIMIT = 12
+
+# Off-track tuning
+SOFT_OFFTRACK_LATERAL = 2.20
+HARD_OFFTRACK_LATERAL = 2.80
+TERMINAL_OFFTRACK_LATERAL = 3.25
+OFFTRACK_COUNTER_LIMIT = 12
 
 # DQN chooses from a fixed discrete list of continuous CarRacing actions.
-# Each action is still [steering, gas, brake].
+# Each action is [steering, gas, brake].
+# Negative steer = left, positive steer = right.
 ACTIONS = [
-    np.array([0.00, 0.36, 0.00], dtype=np.float32),
-    np.array([0.00, 0.24, 0.00], dtype=np.float32),
-    np.array([0.00, 0.10, 0.18], dtype=np.float32),
+    np.array([0.00, 0.32, 0.00], dtype=np.float32),
+    np.array([0.00, 0.22, 0.00], dtype=np.float32),
+    np.array([0.00, 0.08, 0.20], dtype=np.float32),
 
-    np.array([-0.08, 0.34, 0.00], dtype=np.float32),
-    np.array([0.08, 0.34, 0.00], dtype=np.float32),
+    np.array([-0.08, 0.30, 0.00], dtype=np.float32),
+    np.array([0.08, 0.30, 0.00], dtype=np.float32),
 
-    np.array([-0.16, 0.30, 0.00], dtype=np.float32),
-    np.array([0.16, 0.30, 0.00], dtype=np.float32),
+    np.array([-0.16, 0.26, 0.00], dtype=np.float32),
+    np.array([0.16, 0.26, 0.00], dtype=np.float32),
 
-    np.array([-0.28, 0.22, 0.02], dtype=np.float32),
-    np.array([0.28, 0.22, 0.02], dtype=np.float32),
+    np.array([-0.28, 0.18, 0.04], dtype=np.float32),
+    np.array([0.28, 0.18, 0.04], dtype=np.float32),
 
-    np.array([-0.42, 0.12, 0.08], dtype=np.float32),
-    np.array([0.42, 0.12, 0.08], dtype=np.float32),
+    np.array([-0.42, 0.08, 0.12], dtype=np.float32),
+    np.array([0.42, 0.08, 0.12], dtype=np.float32),
 
-    np.array([-0.55, 0.04, 0.18], dtype=np.float32),
-    np.array([0.55, 0.04, 0.18], dtype=np.float32),
+    np.array([-0.55, 0.02, 0.25], dtype=np.float32),
+    np.array([0.55, 0.02, 0.25], dtype=np.float32),
 ]
 
 NUM_ACTIONS = len(ACTIONS)
@@ -115,15 +137,18 @@ class FrameStack:
         return np.stack(self.frames, axis=0)
 
 
+def angle_normalize(x):
+    return (x + np.pi) % (2 * np.pi) - np.pi
+
+
 class VisibleTrackObstacleCarRacing(gym.Wrapper):
     def __init__(
         self,
         env,
         num_obstacles=12,
-        obstacle_radius=0.32,
-        collision_penalty=-35.0,
+        obstacle_radius=OBSTACLE_RADIUS,
+        collision_penalty=COLLISION_PENALTY,
         obstacle_step_penalty=-0.0005,
-        collision_terminate=False,
         debug=False,
     ):
         super().__init__(env)
@@ -132,60 +157,63 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         self.obstacle_radius = obstacle_radius
         self.collision_penalty = collision_penalty
         self.obstacle_step_penalty = obstacle_step_penalty
-        self.collision_terminate = collision_terminate
         self.debug = debug
 
         self.obstacles = []
         self._added_to_road = False
-        self.offtrack_counter = 0
-        self.collision_cooldown = 0
-        self.prev_progress = 0.0
 
-        # Prevent reward explosion near the finish line.
+        self.offtrack_counter = 0
+        self.wrong_way_counter = 0
+        self.backward_index_counter = 0
+
+        self.prev_progress = 0.0
+        self.prev_track_idx = None
+        self.forward_index_steps = 0
+        self.backward_index_steps = 0
+
         self.near_finish_bonus_given = False
         self.lap_bonus_given = False
 
-        # One-time milestone bonuses.
-        self.milestone_25_given = False
-        self.milestone_50_given = False
-        self.milestone_75_given = False
-
-        # Stall detection: terminate if no progress for too long.
-        self.stall_counter = 0
-        self.stall_best_progress = 0.0
+        self.step_count = 0
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
 
         self.obstacles = []
         self._added_to_road = False
-        self.offtrack_counter = 0
-        self.collision_cooldown = 0
-        self.prev_progress = 0.0
 
-        # Reset one-time finish bonuses every episode.
+        self.offtrack_counter = 0
+        self.wrong_way_counter = 0
+        self.backward_index_counter = 0
+
+        self.prev_progress = 0.0
+        self.prev_track_idx = None
+        self.forward_index_steps = 0
+        self.backward_index_steps = 0
+
         self.near_finish_bonus_given = False
         self.lap_bonus_given = False
-        self.milestone_25_given = False
-        self.milestone_50_given = False
-        self.milestone_75_given = False
-        self.stall_counter = 0
-        self.stall_best_progress = 0.0
+
+        self.step_count = 0
 
         self._spawn_fixed_world_obstacles()
         self._add_obstacles_to_road_render()
 
-        # Return rendered frame after adding visible obstacles.
         obs = self.env.render()
+
+        current_idx = self._nearest_track_index()
+        self.prev_track_idx = current_idx
 
         if self.debug:
             base = self.env.unwrapped
-            print("\n[DEBUG] fixed obstacles:", len(self.obstacles))
-            print("[DEBUG] road_poly length:", len(getattr(base, "road_poly", [])))
+            print("\n[RESET DEBUG]")
+            print(f"[RESET DEBUG] fixed obstacles: {len(self.obstacles)}")
+            print(f"[RESET DEBUG] road_poly length: {len(getattr(base, 'road_poly', []))}")
+            print(f"[RESET DEBUG] initial_track_idx={self.prev_track_idx}")
 
-            for i, ob in enumerate(self.obstacles[:8]):
+            for i, ob in enumerate(self.obstacles[:12]):
                 print(
-                    f"[DEBUG] obstacle {i}: "
+                    f"[RESET DEBUG] obstacle {i:02d}: "
                     f"x={ob['x']:.2f}, y={ob['y']:.2f}, "
                     f"offset={ob['offset']:.2f}, r={ob['r']:.2f}, "
                     f"track_index={ob['track_index']}"
@@ -194,139 +222,198 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         return obs, info
 
     def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        self.step_count += 1
 
-        # Always use current rendered frame after physics step.
+        obs, reward, terminated, truncated, info = self.env.step(action)
         obs = self.env.render()
 
-        lateral_signed = self._track_lateral_position()
+        current_idx = self._nearest_track_index()
+        lateral_signed = self._track_lateral_position(current_idx)
         lateral = abs(lateral_signed)
         speed = self._car_speed()
-        heading_error = abs(self._heading_error_to_track())
+        heading_error_signed = self._heading_error_to_track(current_idx)
+        heading_error = abs(heading_error_signed)
         progress = self._track_progress()
+
+        index_delta, moving_forward_by_index = self._track_index_delta(current_idx)
+        heading_dot = self._heading_alignment_dot(current_idx)
+        wrong_way = self._is_wrong_way(index_delta, moving_forward_by_index, heading_dot, speed)
 
         progress_delta = progress - self.prev_progress
 
+        # If progress wraps around at lap completion, do not count it as negative.
         if progress_delta < -0.50:
             progress_delta = 0.0
 
+        # Do not reward negative progress.
         progress_delta = max(0.0, progress_delta)
         self.prev_progress = progress
 
-        hit = self._check_collision()
+        hit, hit_obstacle = self._check_collision(return_obstacle=True)
 
         info["lateral"] = lateral
         info["lateral_signed"] = lateral_signed
         info["speed"] = speed
         info["heading_error"] = heading_error
+        info["heading_error_signed"] = heading_error_signed
+        info["heading_dot"] = heading_dot
         info["progress"] = progress
         info["progress_delta"] = progress_delta
+        info["track_index"] = -1 if current_idx is None else int(current_idx)
+        info["track_index_delta"] = int(index_delta)
+        info["moving_forward_by_index"] = bool(moving_forward_by_index)
+        info["wrong_way"] = bool(wrong_way)
+        info["wrong_way_counter"] = int(self.wrong_way_counter)
+        info["backward_index_counter"] = int(self.backward_index_counter)
         info["lap_complete"] = progress >= 0.95
         info["hit_obstacle"] = False
         info["off_track_terminated"] = False
+        info["wrong_way_terminated"] = False
+        info["collision_terminated"] = False
 
-        # Start with original Gymnasium CarRacing reward.
-        # Base env already gives:
-        # -0.1 per frame
-        # +1000 / total_tiles for each new visited tile
         reward = float(reward)
 
-        # Small custom progress shaping.
-        reward += 3.0 * progress_delta
+        # -----------------------------
+        # 1. Progress reward / penalty
+        # -----------------------------
+        reward += 8.0 * progress_delta
 
-        # Obstacle collision penalty.
-        # Cooldown prevents one crash from applying penalty every frame.
-        if self.collision_cooldown > 0:
-            self.collision_cooldown -= 1
+        if speed > 3.0 and progress_delta <= 0.00001:
+            reward -= 0.04
 
-        if hit and self.collision_cooldown == 0:
+        # -----------------------------
+        # 2. Collision handling
+        # -----------------------------
+        if hit:
             reward += self.collision_penalty
-            self.collision_cooldown = 20
             info["hit_obstacle"] = True
-            if self.collision_terminate:
+            info["collision_terminated"] = True
+
+            if hit_obstacle is not None:
+                info["hit_obstacle_track_index"] = int(hit_obstacle["track_index"])
+                info["hit_obstacle_x"] = float(hit_obstacle["x"])
+                info["hit_obstacle_y"] = float(hit_obstacle["y"])
+
+            if TERMINATE_ON_OBSTACLE_HIT:
                 terminated = True
+
         else:
             reward += self.obstacle_step_penalty
 
-        # Off-track recovery logic.
-        if lateral > 3.25:
+        # -----------------------------
+        # 3. Off-track handling
+        # -----------------------------
+        if lateral > TERMINAL_OFFTRACK_LATERAL:
+            self.offtrack_counter += 2
+            reward -= 4.0
+
+        elif lateral > HARD_OFFTRACK_LATERAL:
             self.offtrack_counter += 1
-            reward -= 2.0
-        elif lateral > 2.75:
+            reward -= 1.5
+
+        elif lateral > SOFT_OFFTRACK_LATERAL:
             self.offtrack_counter += 1
-            reward -= 0.60
+            reward -= 0.50
+
         else:
             self.offtrack_counter = max(0, self.offtrack_counter - 2)
 
-        if self.offtrack_counter >= 25:
-            reward -= 25.0
-            terminated = True
+        info["offtrack_counter"] = int(self.offtrack_counter)
+
+        if self.offtrack_counter >= OFFTRACK_COUNTER_LIMIT:
+            reward -= 40.0
             info["off_track_terminated"] = True
 
-        # Centering reward.
-        if lateral < 1.20:
+            if TERMINATE_ON_OFF_TRACK:
+                terminated = True
+
+        # -----------------------------
+        # 4. Centering reward
+        # -----------------------------
+        if lateral < 0.90:
+            reward += 0.08
+        elif lateral < 1.40:
             reward += 0.04
         elif lateral < 2.00:
-            reward += 0.015
+            reward += 0.01
         elif lateral > 2.40:
-            reward -= 0.15
+            reward -= 0.25
 
-        # Heading shaping.
-        if heading_error < 0.25:
-            reward += 0.035
-        elif heading_error > 0.95:
-            reward -= 0.20
+        # -----------------------------
+        # 5. Direction / wrong-way handling
+        # -----------------------------
+        if wrong_way:
+            self.wrong_way_counter += 1
+            reward -= 1.0
+        else:
+            self.wrong_way_counter = max(0, self.wrong_way_counter - 2)
 
-        # Forward direction shaping: penalize driving backward along the track.
-        forward_align = self._forward_velocity_alignment()
-        if forward_align < -0.3:
-            reward -= 0.50
-        elif forward_align < 0.0:
-            reward -= 0.10
+        info["wrong_way_counter"] = int(self.wrong_way_counter)
 
-        # Speed shaping.
-        if 8.0 <= speed <= 30.0:
+        if self.wrong_way_counter >= WRONG_WAY_COUNTER_LIMIT:
+            reward -= 50.0
+            info["wrong_way_terminated"] = True
+
+            if TERMINATE_ON_WRONG_WAY:
+                terminated = True
+
+        if heading_dot > 0.75:
+            reward += 0.06
+        elif heading_dot > 0.40:
             reward += 0.025
-        elif 30.0 < speed <= 42.0:
-            reward -= 0.04
-        elif speed > 42.0:
-            reward -= 0.12
-        elif speed < 2.5:
+        elif heading_dot < 0.0:
             reward -= 0.30
 
-        # Stall detection: penalise and terminate if stuck with no progress.
-        if progress > self.stall_best_progress + 0.001:
-            self.stall_best_progress = progress
-            self.stall_counter = 0
+        # -----------------------------
+        # 6. Heading error shaping
+        # -----------------------------
+        if heading_error < 0.25:
+            reward += 0.04
+        elif heading_error > 0.95:
+            reward -= 0.25
+
+        # -----------------------------
+        # 7. Speed shaping
+        # -----------------------------
+        # Safer speed range because obstacles exist.
+        if 8.0 <= speed <= 26.0:
+            reward += 0.04
+        elif 26.0 < speed <= 36.0:
+            reward -= 0.03
+        elif speed > 36.0:
+            reward -= 0.25
+        elif speed < 2.5:
+            reward -= 0.04
+
+        # -----------------------------
+        # 8. Obstacle proximity handling
+        # -----------------------------
+        near_ob = self.nearest_forward_obstacle(lookahead=28)
+
+        if near_ob is not None:
+            car = getattr(self.env.unwrapped, "car", None)
+
+            if car is not None:
+                car_x = car.hull.position[0]
+                car_y = car.hull.position[1]
+                dist_to_ob = np.sqrt((car_x - near_ob["x"]) ** 2 + (car_y - near_ob["y"]) ** 2)
+                info["nearest_obstacle_dist"] = float(dist_to_ob)
+                info["nearest_obstacle_offset"] = float(near_ob["offset"])
+                info["nearest_obstacle_track_index"] = int(near_ob["track_index"])
+
+                if dist_to_ob < 8.0 and speed > 26.0:
+                    reward -= 0.40
+                elif dist_to_ob < 12.0 and speed > 32.0:
+                    reward -= 0.25
+
         else:
-            self.stall_counter += 1
+            info["nearest_obstacle_dist"] = None
+            info["nearest_obstacle_offset"] = None
+            info["nearest_obstacle_track_index"] = None
 
-        if self.stall_counter >= 200:
-            reward -= 20.0
-            terminated = True
-
-        # Slow down near obstacles.
-        near_ob = self.nearest_forward_obstacle(lookahead=22)
-
-        if near_ob is not None and speed > 32.0:
-            reward -= 0.15
-
-        # One-time milestone bonuses to densify the reward signal.
-        if progress >= 0.25 and not self.milestone_25_given:
-            reward += 8.0
-            self.milestone_25_given = True
-
-        if progress >= 0.50 and not self.milestone_50_given:
-            reward += 8.0
-            self.milestone_50_given = True
-
-        if progress >= 0.75 and not self.milestone_75_given:
-            reward += 8.0
-            self.milestone_75_given = True
-
-        # IMPORTANT FIX:
-        # These bonuses are now one-time only.
-        # Before, +100 was being added every frame after 95%.
+        # -----------------------------
+        # 9. One-time finish bonuses
+        # -----------------------------
         if progress >= 0.90 and not self.near_finish_bonus_given:
             reward += 10.0
             self.near_finish_bonus_given = True
@@ -336,10 +423,50 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             self.lap_bonus_given = True
             info["lap_complete"] = True
 
+        # Update previous index after all calculations.
+        self.prev_track_idx = current_idx
+
+        if self.debug and (
+            self.step_count <= DEBUG_FIRST_STEPS
+            or self.step_count % DEBUG_EVERY == 0
+            or hit
+            or info["off_track_terminated"]
+            or info["wrong_way_terminated"]
+        ):
+            self._print_step_debug(
+                action=action,
+                reward=reward,
+                terminated=terminated,
+                truncated=truncated,
+                info=info,
+            )
+
         return obs, reward, terminated, truncated, info
 
     def render(self):
         return self.env.render()
+
+    def _print_step_debug(self, action, reward, terminated, truncated, info):
+        print(
+            f"[STEP DEBUG] step={self.step_count:04d} | "
+            f"reward={reward:+8.3f} | "
+            f"term={terminated} trunc={truncated} | "
+            f"idx={info.get('track_index')} d_idx={info.get('track_index_delta')} | "
+            f"forward_idx={info.get('moving_forward_by_index')} | "
+            f"progress={info.get('progress', 0.0) * 100:6.2f}% | "
+            f"d_prog={info.get('progress_delta', 0.0) * 100:7.4f}% | "
+            f"lat={info.get('lateral', 0.0):5.2f} signed={info.get('lateral_signed', 0.0):+5.2f} | "
+            f"speed={info.get('speed', 0.0):5.2f} | "
+            f"head_err={info.get('heading_error', 0.0):5.2f} | "
+            f"head_dot={info.get('heading_dot', 0.0):+5.2f} | "
+            f"wrong={info.get('wrong_way')} wc={info.get('wrong_way_counter')} | "
+            f"offc={info.get('offtrack_counter')} | "
+            f"hit={info.get('hit_obstacle')} | "
+            f"offterm={info.get('off_track_terminated')} | "
+            f"wrongterm={info.get('wrong_way_terminated')} | "
+            f"action=[{action[0]:+.2f},{action[1]:.2f},{action[2]:.2f}] | "
+            f"near_ob_dist={info.get('nearest_obstacle_dist')}"
+        )
 
     def _spawn_fixed_world_obstacles(self):
         base = self.env.unwrapped
@@ -350,11 +477,17 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         n = len(track)
 
-        # Avoid very beginning and very end.
         start = int(0.16 * n)
         end = int(0.88 * n)
 
         obstacle_indices = np.linspace(start, end, self.num_obstacles, dtype=int)
+
+        offset_pattern = [
+            -1.15, 1.15,
+            -1.35, 1.35,
+            -0.95, 0.95,
+            -1.25, 1.25,
+        ]
 
         used_positions = []
 
@@ -364,12 +497,6 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             nx = -np.sin(beta)
             ny = np.cos(beta)
 
-            offset_pattern = [
-                -1.15, 1.15,
-                -1.35, 1.35,
-                -0.95, 0.95,
-                -1.25, 1.25,
-            ]
             offset = offset_pattern[k % len(offset_pattern)]
 
             ox = x + offset * nx
@@ -417,14 +544,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         y2 = cy + length * ty
 
         segments = []
+        segments.append(([(x1, y1), (x2, y2)], (40, 40, 40)))
 
-        # Main wire.
-        segments.append((
-            [(x1, y1), (x2, y2)],
-            (40, 40, 40)
-        ))
-
-        # Small sharp barbs.
         for s in [-0.65, -0.25, 0.20, 0.60]:
             bx = cx + s * length * tx
             by = cy + s * length * ty
@@ -464,11 +585,9 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
             if track is not None and len(track) > ob["track_index"]:
                 _, beta, _, _ = track[ob["track_index"]]
 
-            # Small warning base under the wire.
-            warning = self._make_circle_polygon(ob["x"], ob["y"], ob["r"] * 1.45)
+            warning = self._make_circle_polygon(ob["x"], ob["y"], ob["r"] * 1.55)
             base.road_poly.append((warning, (180, 40, 40)))
 
-            # Draw barbed wire as multiple thin dark polygons.
             segments = self._make_barbed_wire_segments(
                 ob["x"],
                 ob["y"],
@@ -522,7 +641,34 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         return best_idx
 
-    def _track_lateral_position(self):
+    def _track_index_delta(self, current_idx):
+        if current_idx is None or self.prev_track_idx is None:
+            return 0, True
+
+        track = getattr(self.env.unwrapped, "track", None)
+
+        if track is None or len(track) == 0:
+            return 0, True
+
+        n = len(track)
+
+        forward_delta = (current_idx - self.prev_track_idx) % n
+        backward_delta = (self.prev_track_idx - current_idx) % n
+
+        # If the car barely moved or nearest tile jitters, treat as neutral.
+        if forward_delta == 0 or min(forward_delta, backward_delta) <= 1:
+            return 0, True
+
+        if forward_delta < backward_delta:
+            self.forward_index_steps += 1
+            self.backward_index_counter = max(0, self.backward_index_counter - 1)
+            return int(forward_delta), True
+
+        self.backward_index_steps += 1
+        self.backward_index_counter += 1
+        return -int(backward_delta), False
+
+    def _track_lateral_position(self, idx=None):
         base = self.env.unwrapped
         car = getattr(base, "car", None)
         track = getattr(base, "track", None)
@@ -530,7 +676,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         if car is None or track is None or len(track) == 0:
             return 0.0
 
-        idx = self._nearest_track_index()
+        if idx is None:
+            idx = self._nearest_track_index()
 
         if idx is None:
             return 0.0
@@ -545,7 +692,7 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         return float((car_x - tx) * nx + (car_y - ty) * ny)
 
-    def _heading_error_to_track(self):
+    def _heading_error_to_track(self, idx=None):
         base = self.env.unwrapped
         car = getattr(base, "car", None)
         track = getattr(base, "track", None)
@@ -553,7 +700,8 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         if car is None or track is None or len(track) == 0:
             return 0.0
 
-        idx = self._nearest_track_index()
+        if idx is None:
+            idx = self._nearest_track_index()
 
         if idx is None:
             return 0.0
@@ -562,36 +710,54 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
         car_angle = car.hull.angle
 
         diff = beta - car_angle
-        diff = (diff + np.pi) % (2 * np.pi) - np.pi
+        diff = angle_normalize(diff)
 
         return float(diff)
 
-    def _forward_velocity_alignment(self):
+    def _heading_alignment_dot(self, idx=None):
         base = self.env.unwrapped
         car = getattr(base, "car", None)
         track = getattr(base, "track", None)
 
         if car is None or track is None or len(track) == 0:
-            return 0.0
-
-        idx = self._nearest_track_index()
+            return 1.0
 
         if idx is None:
-            return 0.0
+            idx = self._nearest_track_index()
+
+        if idx is None:
+            return 1.0
 
         _, beta, _, _ = track[idx]
 
-        # Track forward direction vector.
-        tx = np.cos(beta)
-        ty = np.sin(beta)
+        # Car forward vector from hull angle.
+        car_angle = car.hull.angle
+        car_fx = np.cos(car_angle)
+        car_fy = np.sin(car_angle)
 
-        v = car.hull.linearVelocity
-        speed = float(np.sqrt(v[0] ** 2 + v[1] ** 2))
+        # Track forward vector.
+        track_fx = np.cos(beta)
+        track_fy = np.sin(beta)
 
-        if speed < 0.5:
-            return 0.0
+        return float(car_fx * track_fx + car_fy * track_fy)
 
-        return float((v[0] * tx + v[1] * ty) / speed)
+    def _is_wrong_way(self, index_delta, moving_forward_by_index, heading_dot, speed):
+        if speed < 3.0:
+            return False
+
+        heading_wrong = heading_dot < WRONG_WAY_DOT_THRESHOLD
+        index_wrong = (not moving_forward_by_index) and index_delta < 0
+
+        if index_wrong and self.backward_index_counter >= 3:
+            return True
+
+        if heading_wrong and self.backward_index_counter >= 2:
+            return True
+
+        if self.backward_index_counter >= BACKWARD_INDEX_COUNTER_LIMIT:
+            return True
+
+        return False
 
     def _car_speed(self):
         base = self.env.unwrapped
@@ -615,25 +781,24 @@ class VisibleTrackObstacleCarRacing(gym.Wrapper):
 
         return float(visited / max(1, total))
 
-    def _check_collision(self):
+    def _check_collision(self, return_obstacle=False):
         base = self.env.unwrapped
         car = getattr(base, "car", None)
 
         if car is None:
-            return False
+            return (False, None) if return_obstacle else False
 
         car_x = car.hull.position[0]
         car_y = car.hull.position[1]
 
-        car_radius = 0.75
-
         for ob in self.obstacles:
             d = np.sqrt((car_x - ob["x"]) ** 2 + (car_y - ob["y"]) ** 2)
 
-            if d < car_radius + ob["r"]:
-                return True
+            # Slightly bigger collision radius to avoid visually passing through obstacle.
+            if d < CAR_COLLISION_RADIUS + ob["r"]:
+                return (True, ob) if return_obstacle else True
 
-        return False
+        return (False, None) if return_obstacle else False
 
     def nearest_forward_obstacle(self, lookahead=26):
         base = self.env.unwrapped
@@ -667,22 +832,17 @@ class ReplayBuffer:
         self.buffer = deque(maxlen=capacity)
 
     def push(self, state, action_index, reward, next_state, done):
-        # Small clipping prevents very large target spikes.
-        reward = float(np.clip(reward, -50.0, 50.0))
-        # Store as uint8 (0-255) to use 4x less memory than float32.
-        state_u8 = (state * 255.0).clip(0, 255).astype(np.uint8)
-        next_state_u8 = (next_state * 255.0).clip(0, 255).astype(np.uint8)
-        self.buffer.append((state_u8, action_index, reward, next_state_u8, float(done)))
+        reward = float(np.clip(reward, -80.0, 120.0))
+        self.buffer.append((state, action_index, reward, next_state, float(done)))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        # Convert uint8 back to float32 in [0, 1] at sample time.
-        states = torch.tensor(np.array(states), dtype=torch.float32).div(255.0).to(DEVICE)
+        states = torch.tensor(np.array(states), dtype=torch.float32).to(DEVICE)
         actions = torch.tensor(actions, dtype=torch.long).unsqueeze(1).to(DEVICE)
         rewards = torch.tensor(rewards, dtype=torch.float32).unsqueeze(1).to(DEVICE)
-        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).div(255.0).to(DEVICE)
+        next_states = torch.tensor(np.array(next_states), dtype=torch.float32).to(DEVICE)
         dones = torch.tensor(dones, dtype=torch.float32).unsqueeze(1).to(DEVICE)
 
         return states, actions, rewards, next_states, dones
@@ -765,11 +925,10 @@ class DQNAgent:
         q = self.policy_net(states).gather(1, actions)
 
         with torch.no_grad():
-            # Double DQN target: policy chooses, target evaluates.
             next_actions = self.policy_net(next_states).argmax(1, keepdim=True)
             next_q = self.target_net(next_states).gather(1, next_actions)
             target_q = rewards + GAMMA * (1.0 - dones) * next_q
-            target_q = torch.clamp(target_q, -80.0, 120.0)
+            target_q = torch.clamp(target_q, -100.0, 150.0)
 
         loss = F.smooth_l1_loss(q, target_q)
 
@@ -778,7 +937,7 @@ class DQNAgent:
         torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 5.0)
         self.optimizer.step()
 
-        return loss.item()
+        return float(loss.item())
 
     def update_target(self):
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -809,10 +968,9 @@ def make_env(debug=False):
     env = VisibleTrackObstacleCarRacing(
         base_env,
         num_obstacles=12,
-        obstacle_radius=0.32,
-        collision_penalty=-35.0,
+        obstacle_radius=OBSTACLE_RADIUS,
+        collision_penalty=COLLISION_PENALTY,
         obstacle_step_penalty=-0.0005,
-        collision_terminate=False,
         debug=debug,
     )
 
@@ -824,17 +982,13 @@ def closest_action_index(action):
     return int(np.argmin(distances))
 
 
-def angle_normalize(x):
-    return (x + np.pi) % (2 * np.pi) - np.pi
-
-
 def simple_centerline_action(env):
     base = env.unwrapped
     car = getattr(base, "car", None)
     track = getattr(base, "track", None)
 
     if car is None or track is None or len(track) == 0:
-        return np.array([0.0, 0.30, 0.0], dtype=np.float32)
+        return np.array([0.0, 0.25, 0.0], dtype=np.float32)
 
     car_x = car.hull.position[0]
     car_y = car.hull.position[1]
@@ -847,24 +1001,31 @@ def simple_centerline_action(env):
 
     nearest = int(np.argmin(dists))
 
-    target = (nearest + 8) % len(track)
+    speed = env._car_speed() if hasattr(env, "_car_speed") else 0.0
+    lookahead = int(np.clip(8 + speed * 0.25, 8, 18))
+
+    target = (nearest + lookahead) % len(track)
     _, _, tx, ty = track[target]
 
     desired_angle = np.arctan2(ty - car_y, tx - car_x)
     angle_diff = angle_normalize(desired_angle - car_angle)
 
-    steering = float(np.clip(angle_diff * 0.75, -0.52, 0.52))
+    steering = float(np.clip(angle_diff * 0.85, -0.55, 0.55))
 
     lateral_signed = 0.0
 
     if hasattr(env, "_track_lateral_position"):
-        lateral_signed = env._track_lateral_position()
+        lateral_signed = env._track_lateral_position(nearest)
 
-    # Strong center recovery before grass.
-    if lateral_signed > 1.55:
-        steering -= 0.35
-    elif lateral_signed < -1.55:
-        steering += 0.35
+    if lateral_signed > 1.20:
+        steering -= 0.25
+    elif lateral_signed < -1.20:
+        steering += 0.25
+
+    if lateral_signed > 1.80:
+        steering -= 0.45
+    elif lateral_signed < -1.80:
+        steering += 0.45
 
     nearest_ob = None
 
@@ -882,34 +1043,48 @@ def simple_centerline_action(env):
             obstacle_close = True
             ob_offset = nearest_ob["offset"]
 
-            # Avoid obstacle but do not over-dodge into grass.
             if ob_offset > 0:
-                steering -= 0.25
+                steering -= 0.28
             else:
-                steering += 0.25
+                steering += 0.28
 
-            # If already near edge, recover center first.
-            if lateral_signed > 1.70:
-                steering -= 0.45
-            elif lateral_signed < -1.70:
-                steering += 0.45
+            if lateral_signed > 1.60:
+                steering -= 0.55
+            elif lateral_signed < -1.60:
+                steering += 0.55
 
     steering = float(np.clip(steering, -0.55, 0.55))
 
     if obstacle_close:
-        gas = 0.14
-        brake = 0.10
+        gas = 0.10
+        brake = 0.18
     elif abs(steering) < 0.12:
-        gas = 0.34
+        gas = 0.30
         brake = 0.00
     elif abs(steering) < 0.32:
-        gas = 0.24
-        brake = 0.02
+        gas = 0.22
+        brake = 0.03
     else:
-        gas = 0.12
-        brake = 0.08
+        gas = 0.08
+        brake = 0.12
 
     return np.array([steering, gas, brake], dtype=np.float32)
+
+
+def upscale_frames(frames, scale=4):
+    high_quality = []
+
+    for frame in frames:
+        enlarged = cv2.resize(
+            frame,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        high_quality.append(enlarged)
+
+    return high_quality
 
 
 def save_video(frames, path, fps=30, scale=4):
@@ -917,19 +1092,9 @@ def save_video(frames, path, fps=30, scale=4):
         print(f"[WARNING] No frames to save for {path}")
         return
 
-    h, w = frames[0].shape[:2]
-    h_out = ((h * scale + 15) // 16) * 16
-    w_out = ((w * scale + 15) // 16) * 16
-
-    # Stream one frame at a time to avoid loading all upscaled frames into RAM.
-    with imageio.get_writer(path, fps=fps) as writer:
-        for frame in frames:
-            enlarged = cv2.resize(
-                frame, (w_out, h_out), interpolation=cv2.INTER_CUBIC
-            )
-            writer.append_data(enlarged)
-
-    print(f"[VIDEO SAVE] Saved {len(frames)} frames to {path}")
+    frames = upscale_frames(frames, scale=scale)
+    imageio.mimsave(path, frames, fps=fps, quality=9, macro_block_size=16)
+    print(f"[VIDEO SAVE] Saved video to {path}")
 
 
 def save_best_metadata(metadata, path=BEST_METADATA_PATH):
@@ -980,54 +1145,34 @@ def should_save_episode(
     lap_complete,
     hit_obstacle,
     off_track,
+    wrong_way_terminated,
     best_progress,
     best_clean_progress,
 ):
-    """
-    Saving policy:
-    1. Never save off-track episodes.
-    2. Prefer clean episodes: no obstacle hit and no off-track.
-    3. Save clean lap completion.
-    4. Save better clean progress.
-    5. Allow hit episodes only if progress is much better than previous best.
-    """
-
-    clean_episode = (not off_track) and (not hit_obstacle)
-    valid_episode = not off_track
+    clean_episode = (not off_track) and (not hit_obstacle) and (not wrong_way_terminated)
+    valid_episode = (not off_track) and (not wrong_way_terminated)
 
     save_score = (
-        10000.0 * max_progress
+        12000.0 * max_progress
         + episode_reward
-        - (500.0 if hit_obstacle else 0.0)
-        - (2000.0 if off_track else 0.0)
+        - (1200.0 if hit_obstacle else 0.0)
+        - (3000.0 if off_track else 0.0)
+        - (2500.0 if wrong_way_terminated else 0.0)
     )
 
-    should_save = False
-    save_reason = ""
-
     if not valid_episode:
-        return False, "not saved: off-track", save_score
+        return False, "not saved: invalid episode", save_score
 
-    # Best possible case.
     if lap_complete and clean_episode:
-        should_save = True
-        save_reason = "clean lap complete"
+        return True, "clean lap complete", save_score
 
-    # Clean progress should be saved aggressively.
-    elif clean_episode and max_progress > best_clean_progress:
-        should_save = True
-        save_reason = "best clean progress"
+    if clean_episode and max_progress > best_clean_progress:
+        return True, "best clean progress", save_score
 
-    # If hit happened, only save when it is clearly much better.
-    # This prevents random hit episodes from replacing clean progress.
-    elif valid_episode and max_progress > best_progress + 0.10:
-        should_save = True
-        save_reason = "best progress with hit"
+    if (not hit_obstacle) and max_progress > best_progress + 0.05:
+        return True, "best progress no hit", save_score
 
-    else:
-        save_reason = "not saved: no improvement"
-
-    return should_save, save_reason, save_score
+    return False, "not saved: no improvement", save_score
 
 
 def train():
@@ -1036,12 +1181,6 @@ def train():
 
     agent = DQNAgent()
     replay_buffer = ReplayBuffer(BUFFER_SIZE)
-
-    if RESUME_TRAINING and os.path.exists(MODEL_PATH):
-        agent.load(MODEL_PATH)
-        print(f"[RESUME] Loaded model from {MODEL_PATH} (steps_done={agent.steps_done}, epsilon={agent.epsilon():.3f})")
-    else:
-        print("[TRAIN] Starting from scratch.")
 
     warmup_replay_buffer(env, stacker, replay_buffer)
 
@@ -1058,20 +1197,20 @@ def train():
         obs, info = env.reset(seed=episode_seed)
         state = stacker.reset(obs)
 
-        # Store frames from THIS episode.
-        # If this episode becomes best, these exact frames get saved.
         episode_frames = []
         episode_frames.append(obs.copy())
 
         episode_reward = 0.0
         hit_obstacle = False
         off_track = False
+        wrong_way_terminated = False
         last_loss = None
         lap_complete = False
         max_progress = 0.0
 
         lateral_sum = 0.0
         speed_sum = 0.0
+        wrong_way_steps = 0
 
         action_counts = np.zeros(NUM_ACTIONS, dtype=np.int32)
 
@@ -1085,7 +1224,6 @@ def train():
             next_obs, reward, terminated, truncated, info = env.step(action)
             next_state = stacker.step(next_obs)
 
-            # Store actual frame from training episode.
             episode_frames.append(next_obs.copy())
 
             done = terminated or truncated
@@ -1098,6 +1236,9 @@ def train():
             lateral_sum += info.get("lateral", 0.0)
             speed_sum += info.get("speed", 0.0)
             max_progress = max(max_progress, info.get("progress", 0.0))
+
+            if info.get("wrong_way", False):
+                wrong_way_steps += 1
 
             if info.get("lap_complete", False):
                 lap_complete = True
@@ -1114,6 +1255,9 @@ def train():
             if info.get("off_track_terminated", False):
                 off_track = True
 
+            if info.get("wrong_way_terminated", False):
+                wrong_way_terminated = True
+
             if done:
                 break
 
@@ -1126,6 +1270,7 @@ def train():
             lap_complete=lap_complete,
             hit_obstacle=hit_obstacle,
             off_track=off_track,
+            wrong_way_terminated=wrong_way_terminated,
             best_progress=best_progress,
             best_clean_progress=best_clean_progress,
         )
@@ -1134,15 +1279,13 @@ def train():
             best_score = save_score
             best_progress = max(best_progress, max_progress)
 
-            if not hit_obstacle and not off_track:
+            if not hit_obstacle and not off_track and not wrong_way_terminated:
                 best_clean_progress = max(best_clean_progress, max_progress)
 
             best_episode = episode
 
             agent.save(MODEL_PATH)
 
-            # IMPORTANT FIX:
-            # Save the exact episode that caused the model save.
             save_video(
                 episode_frames,
                 BEST_EPISODE_VIDEO_PATH,
@@ -1159,6 +1302,8 @@ def train():
                 "lap_complete": lap_complete,
                 "hit_obstacle": hit_obstacle,
                 "off_track": off_track,
+                "wrong_way_terminated": wrong_way_terminated,
+                "wrong_way_steps": wrong_way_steps,
                 "steps": step + 1,
                 "avg_lateral": avg_lateral,
                 "avg_speed": avg_speed,
@@ -1180,6 +1325,7 @@ def train():
                 f"save_score={save_score:.2f} | "
                 f"hit={hit_obstacle} | "
                 f"offtrack={off_track} | "
+                f"wrongterm={wrong_way_terminated} | "
                 f"best_video={BEST_EPISODE_VIDEO_PATH}"
             )
 
@@ -1197,6 +1343,8 @@ def train():
             f"Epsilon: {agent.epsilon():.3f} | "
             f"Hit: {hit_obstacle} | "
             f"OffTrack: {off_track} | "
+            f"WrongTerm: {wrong_way_terminated} | "
+            f"WrongSteps: {wrong_way_steps} | "
             f"AvgLat: {avg_lateral:.2f} | "
             f"AvgSpeed: {avg_speed:.2f} | "
             f"Buffer: {len(replay_buffer)} | "
@@ -1210,13 +1358,13 @@ def train():
         print("[WARNING] No good model was saved. Saving final model instead.")
         agent.save(MODEL_PATH)
 
-    print(f"Training complete.")
+    print("Training complete.")
     print(f"Best model saved to: {MODEL_PATH}")
     print(f"Best episode video saved to: {BEST_EPISODE_VIDEO_PATH}")
     print(f"Best metadata saved to: {BEST_METADATA_PATH}")
 
 
-def record_debug_video(video_path="debug_visible_obstacles_v3.mp4"):
+def record_debug_video(video_path="debug_visible_obstacles_v4.mp4"):
     env = make_env(debug=True)
     frames = []
 
@@ -1226,6 +1374,7 @@ def record_debug_video(video_path="debug_visible_obstacles_v3.mp4"):
     total_reward = 0.0
     hit_obstacle = False
     off_track = False
+    wrong_way_terminated = False
     max_progress = 0.0
 
     for step in range(900):
@@ -1243,6 +1392,9 @@ def record_debug_video(video_path="debug_visible_obstacles_v3.mp4"):
         if info.get("off_track_terminated", False):
             off_track = True
 
+        if info.get("wrong_way_terminated", False):
+            wrong_way_terminated = True
+
         if terminated or truncated:
             break
 
@@ -1255,20 +1407,12 @@ def record_debug_video(video_path="debug_visible_obstacles_v3.mp4"):
         f"steps={step + 1}, "
         f"progress={max_progress * 100:.2f}%, "
         f"hit_obstacle={hit_obstacle}, "
-        f"off_track={off_track}"
+        f"off_track={off_track}, "
+        f"wrong_way_terminated={wrong_way_terminated}"
     )
 
 
 def record_trained_video(video_path=VIDEO_PATH, seed=SEED):
-    """
-    This re-runs the saved model.
-    Important: this is NOT guaranteed to look exactly like the best training episode,
-    because it is a fresh rollout.
-
-    The actual best episode video is saved during training as:
-    BEST_EPISODE_VIDEO_PATH
-    """
-
     if not os.path.exists(MODEL_PATH):
         print(f"[WARNING] Model file not found: {MODEL_PATH}")
         print("[WARNING] Skipping trained video.")
@@ -1290,6 +1434,7 @@ def record_trained_video(video_path=VIDEO_PATH, seed=SEED):
     total_reward = 0.0
     hit_obstacle = False
     off_track = False
+    wrong_way_terminated = False
     max_progress = 0.0
     lap_complete = False
 
@@ -1317,6 +1462,9 @@ def record_trained_video(video_path=VIDEO_PATH, seed=SEED):
         if info.get("off_track_terminated", False):
             off_track = True
 
+        if info.get("wrong_way_terminated", False):
+            wrong_way_terminated = True
+
         if terminated or truncated:
             break
 
@@ -1331,7 +1479,9 @@ def record_trained_video(video_path=VIDEO_PATH, seed=SEED):
         f"lap_complete={lap_complete}, "
         f"hit_obstacle={hit_obstacle}, "
         f"off_track={off_track}, "
-        f"seed={seed}"
+        f"wrong_way_terminated={wrong_way_terminated}, "
+        f"seed={seed}, "
+        f"action_counts={action_counts.tolist()}"
     )
 
     print(f"Saved trained replay video to {video_path}")
@@ -1346,6 +1496,6 @@ if __name__ == "__main__":
     record_debug_video()
     train()
 
-    # This is just a replay of the saved model.
-    # The real best episode video is saved during training.
+    # This is only a fresh replay of the saved model.
+    # The actual best episode video is saved during training.
     record_trained_video()
