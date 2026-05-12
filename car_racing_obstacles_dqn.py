@@ -72,7 +72,7 @@ TERMINAL_OFFTRACK_LATERAL = 3.25
 OFFTRACK_COUNTER_LIMIT = 12
 
 # DQN chooses from a fixed discrete list of continuous CarRacing actions, with each action being one of the three: [steering, gas, brake].
-# Negative steer = left, positive steer = right.
+# Negative steer = left and positive steer = right
 ACTIONS = [
     np.array([0.00, 0.32, 0.00], dtype=np.float32),
     np.array([0.00, 0.22, 0.00], dtype=np.float32),
@@ -109,7 +109,7 @@ def set_seeds(seed):
 def preprocess_frame(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
 
-    # Remove bottom dashboard area.
+    # Remove the bottom dashboard area
     gray = gray[:84, :]
 
     resized = cv2.resize(gray, (IMAGE_SIZE, IMAGE_SIZE), interpolation=cv2.INTER_AREA)
