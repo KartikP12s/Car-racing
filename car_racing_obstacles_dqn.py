@@ -1,4 +1,4 @@
-# car_racing_obstacles_dqn_fixed_visible_v4.py
+# CS530 Group 8 CarRacing Agent 
 
 import os
 import cv2
